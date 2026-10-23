@@ -61,6 +61,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
@@ -89,6 +90,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -123,6 +125,8 @@ private fun LumaRoomApp() {
     val photos = remember { mutableStateListOf<PhotoItem>().apply { addAll(store.loadPhotos()) } }
     val customPresets = remember { mutableStateListOf<Preset>().apply { addAll(store.loadCustomPresets()) } }
     val favoritePresets = remember { mutableStateListOf<String>().apply { addAll(store.loadFavoritePresets()) } }
+    var albums by remember { mutableStateOf(store.loadAlbums()) }
+    var exportOptions by remember { mutableStateOf(store.loadExportOptions()) }
     var selectedPhoto by remember { mutableStateOf<PhotoItem?>(null) }
     var editing by remember { mutableStateOf(false) }
     var tab by remember { mutableStateOf(AppTab.LIBRARY) }
@@ -162,6 +166,22 @@ private fun LumaRoomApp() {
                     },
                     onCopySettings = store::copySettings,
                     onPasteSettings = store::pastedSettings,
+                    albums = albums,
+                    exportOptions = exportOptions,
+                    onExportOptionsChange = { exportOptions = it; store.saveExportOptions(it) },
+                    onToggleAlbum = { name, uri ->
+                        if (name.isNotBlank()) {
+                            val current = albums.toMutableMap()
+                            val members = (current[name] ?: emptySet()).toMutableSet()
+                            if (uri in members) members.remove(uri) else members.add(uri)
+                            current[name] = members; albums = current; store.saveAlbums(current)
+                        }
+                    },
+                    onCreateAlbum = { name ->
+                        if (name.isNotBlank() && !albums.containsKey(name)) {
+                            val current = albums.toMutableMap(); current[name] = emptySet(); albums = current; store.saveAlbums(current)
+                        }
+                    },
                     onDelete = {
                         val uri = selectedPhoto!!.uri
                         store.removePhoto(uri)
@@ -176,6 +196,7 @@ private fun LumaRoomApp() {
                     when (tab) {
                         AppTab.LIBRARY -> LibraryScreen(
                             photos = photos,
+                            albums = albums,
                             isEdited = store::hasEdit,
                             modifier = Modifier.padding(padding),
                             onImport = { picker.launch(arrayOf("image/*")) },
@@ -200,31 +221,46 @@ private fun displayName(context: android.content.Context, uri: Uri, fallback: St
 
 @Composable
 private fun LibraryScreen(
-    photos: List<PhotoItem>, isEdited: (String) -> Boolean, modifier: Modifier = Modifier,
+    photos: List<PhotoItem>, albums: Map<String, Set<String>>, isEdited: (String) -> Boolean, modifier: Modifier = Modifier,
     onImport: () -> Unit, onPhotoClick: (PhotoItem) -> Unit,
 ) {
     var filter by remember { mutableStateOf("All Photos") }
     var search by remember { mutableStateOf("") }
+    var sort by remember { mutableStateOf("Newest") }
+    var density by remember { mutableIntStateOf(145) }
+    val smartFilters = listOf("All Photos", "Recent", "Favorites", "Rejected", "Edited")
+    if (filter !in smartFilters && !albums.containsKey(filter)) filter = "All Photos"
     val filtered = when (filter) {
         "Favorites" -> photos.filter { it.flagged || it.rating >= 4 }
+        "Rejected" -> photos.filter { it.rejected }
         "Edited" -> photos.filter { isEdited(it.uri) }
         "Recent" -> photos.sortedByDescending { it.importedAt }.take(50)
-        else -> photos
+        "All Photos" -> photos
+        else -> albums[filter]?.let { members -> photos.filter { it.uri in members } } ?: photos
     }
-    val visible = if (search.isBlank()) filtered else filtered.filter { it.name.contains(search.trim(), ignoreCase = true) }
+    val searched = if (search.isBlank()) filtered else filtered.filter { it.name.contains(search.trim(), ignoreCase = true) }
+    val visible = when (sort) {
+        "Oldest" -> searched.sortedBy { it.importedAt }
+        "Name" -> searched.sortedBy { it.name.lowercase() }
+        "Rating" -> searched.sortedByDescending { it.rating }
+        else -> searched.sortedByDescending { it.importedAt }
+    }
     Column(modifier.fillMaxSize().padding(horizontal = 18.dp)) {
         Spacer(Modifier.height(16.dp))
         Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
             Column(Modifier.weight(1f)) {
                 Text("LUMAROOM", color = Accent, fontSize = 11.sp, letterSpacing = 2.6.sp, fontWeight = FontWeight.Bold)
-                Text("All Photos", color = Ink, fontSize = 28.sp, fontWeight = FontWeight.SemiBold)
+                Text(filter, color = Ink, fontSize = 28.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
             }
             IconButton(onClick = onImport, modifier = Modifier.size(46.dp).background(Accent, CircleShape)) { Text("+", color = CanvasBlack, fontSize = 27.sp) }
         }
         Spacer(Modifier.height(18.dp))
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.horizontalScroll(rememberScrollState())) {
-            listOf("All Photos", "Recent", "Favorites", "Edited").forEach { label ->
+            smartFilters.forEach { label ->
                 FilterChip(selected = filter == label, onClick = { filter = label }, label = { Text(label, fontSize = 12.sp) })
+            }
+            albums.keys.sorted().forEach { album ->
+                FilterChip(selected = filter == album, onClick = { filter = album }, label = { Text("▤ $album", fontSize = 12.sp) })
             }
         }
         OutlinedTextField(
@@ -234,13 +270,24 @@ private fun LibraryScreen(
             singleLine = true,
             modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
         )
-        Spacer(Modifier.height(14.dp))
+        Spacer(Modifier.height(12.dp))
+        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState())) {
+            Text("Sort", color = Muted, fontSize = 11.sp, modifier = Modifier.padding(end = 7.dp))
+            listOf("Newest", "Oldest", "Name", "Rating").forEach { option ->
+                FilterChip(selected = sort == option, onClick = { sort = option }, label = { Text(option, fontSize = 10.sp) }, modifier = Modifier.padding(end = 6.dp))
+            }
+            Spacer(Modifier.width(6.dp))
+            listOf("S" to 185, "M" to 145, "L" to 110).forEach { (label, cell) ->
+                FilterChip(selected = density == cell, onClick = { density = cell }, label = { Text(label, fontSize = 10.sp) }, modifier = Modifier.padding(end = 4.dp))
+            }
+        }
+        Spacer(Modifier.height(12.dp))
         if (photos.isEmpty()) EmptyLibrary(onImport, Modifier.weight(1f)) else {
             Row(Modifier.fillMaxWidth().padding(bottom = 10.dp), verticalAlignment = Alignment.CenterVertically) {
                 Text(if (visible.size == 1) "1 photo" else "${visible.size} photos", color = Muted, fontSize = 12.sp, modifier = Modifier.weight(1f))
-                Text("Newest first", color = Muted, fontSize = 12.sp)
+                Text(sort, color = Muted, fontSize = 12.sp)
             }
-            LazyVerticalGrid(columns = GridCells.Adaptive(145.dp), verticalArrangement = Arrangement.spacedBy(6.dp), horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.weight(1f)) {
+            LazyVerticalGrid(columns = GridCells.Adaptive(density.dp), verticalArrangement = Arrangement.spacedBy(6.dp), horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.weight(1f)) {
                 items(visible, key = { it.uri }) { photo -> PhotoTile(photo, isEdited(photo.uri)) { onPhotoClick(photo) } }
             }
         }
@@ -264,6 +311,11 @@ private fun PhotoTile(photo: PhotoItem, edited: Boolean, onClick: () -> Unit) {
         Box(Modifier.fillMaxWidth().height(42.dp).background(Brush.verticalGradient(listOf(Color.Transparent, Color.Black.copy(.78f)))))
         Text(photo.name, color = Color.White, fontSize = 10.sp, maxLines = 1, modifier = Modifier.padding(8.dp))
         if (edited) Text("ADJ", color = Accent, fontSize = 9.sp, fontWeight = FontWeight.Bold, modifier = Modifier.align(Alignment.TopEnd).background(Color.Black.copy(.65f), RoundedCornerShape(bottomStart = 5.dp)).padding(6.dp))
+        if (photo.flagged || photo.rejected || photo.rating > 0) Row(Modifier.align(Alignment.TopStart).background(Color.Black.copy(.6f), RoundedCornerShape(bottomEnd = 5.dp)).padding(horizontal = 5.dp, vertical = 3.dp), verticalAlignment = Alignment.CenterVertically) {
+            if (photo.flagged) Text("⚑", color = WarmAccent, fontSize = 9.sp)
+            if (photo.rejected) Text("✕", color = Color(0xFFFF7777), fontSize = 9.sp)
+            if (photo.rating > 0) Text("★${photo.rating}", color = WarmAccent, fontSize = 9.sp, modifier = Modifier.padding(start = 2.dp))
+        }
     }
 }
 
@@ -317,9 +369,9 @@ private fun SettingsScreen(photoCount: Int, modifier: Modifier = Modifier) {
         Spacer(Modifier.height(18.dp)); Text("SETTINGS", color = Accent, fontSize = 11.sp, letterSpacing = 2.6.sp, fontWeight = FontWeight.Bold)
         Text("LumaRoom Mobile", color = Ink, fontSize = 28.sp, fontWeight = FontWeight.SemiBold); Spacer(Modifier.height(26.dp))
         SettingsRow("Local catalog", "$photoCount photos · SQLite indexed · edits saved automatically")
-        SettingsRow("Export", "JPEG · 94% quality · Pictures/LumaRoom")
+        SettingsRow("Export", "JPEG/PNG · adjustable quality & size · Pictures/LumaRoom")
         SettingsRow("Privacy", "No account · no telemetry · no upload")
-        SettingsRow("About", "Version 0.13.0 · Kotlin + Jetpack Compose")
+        SettingsRow("About", "Version 0.14.0 · Kotlin + Jetpack Compose")
     }
 }
 
@@ -337,6 +389,11 @@ private fun EditorScreen(
     onPhotoUpdate: (PhotoItem) -> Unit,
     onCopySettings: (DevelopState) -> Unit,
     onPasteSettings: () -> DevelopState?,
+    albums: Map<String, Set<String>>,
+    exportOptions: ExportOptions,
+    onExportOptionsChange: (ExportOptions) -> Unit,
+    onToggleAlbum: (String, String) -> Unit,
+    onCreateAlbum: (String) -> Unit,
     onDelete: () -> Unit,
     onSave: (DevelopState) -> Unit, onBack: () -> Unit,
 ) {
@@ -353,6 +410,7 @@ private fun EditorScreen(
     val redo = remember(photo.uri) { mutableStateListOf<DevelopState>() }
     var compare by remember { mutableStateOf(false) }
     var exporting by remember { mutableStateOf(false) }
+    var showExport by remember { mutableStateOf(false) }
     var activeMaskId by remember(photo.uri) { mutableStateOf(initialState.masks.firstOrNull()?.id) }
     var activeSpotId by remember(photo.uri) { mutableStateOf(initialState.healingSpots.firstOrNull()?.id) }
     var historyJob by remember { mutableStateOf<Job?>(null) }
@@ -389,14 +447,21 @@ private fun EditorScreen(
             Column(Modifier.weight(1f)) { Text("EDIT", color = Accent, fontSize = 9.sp, letterSpacing = 2.sp, fontWeight = FontWeight.Bold); Text(photo.name, color = Ink, fontSize = 14.sp, maxLines = 1) }
             ActionText("↶", undo.isNotEmpty()) { historyJob?.cancel(); historyJob = null; redo.add(develop); develop = undo.removeAt(undo.lastIndex) }
             ActionText("↷", redo.isNotEmpty()) { historyJob?.cancel(); historyJob = null; undo.add(develop); develop = redo.removeAt(redo.lastIndex) }
-            Text(if (exporting) "…" else "Share", color = Accent, fontSize = 12.sp, fontWeight = FontWeight.Bold, modifier = Modifier.clickable(enabled = !exporting) {
+            Text(if (exporting) "…" else "Share", color = Accent, fontSize = 12.sp, fontWeight = FontWeight.Bold, modifier = Modifier.clickable(enabled = !exporting) { showExport = true }.padding(10.dp))
+        }
+        if (showExport) ExportDialog(
+            options = exportOptions,
+            onDismiss = { showExport = false },
+            onExport = { chosen ->
+                onExportOptionsChange(chosen)
+                showExport = false
                 exporting = true
                 scope.launch {
-                    val result = ImageExporter.export(context, photo, develop); exporting = false
+                    val result = ImageExporter.export(context, photo, develop, chosen); exporting = false
                     Toast.makeText(context, if (result != null) "Saved to Pictures/LumaRoom" else "Export failed", Toast.LENGTH_LONG).show()
                 }
-            }.padding(10.dp))
-        }
+            },
+        )
         Box(
             Modifier.fillMaxWidth().weight(1f).background(Color(0xFF202124)).then(
                 if (panel == ToolPanel.CROP || panel == ToolPanel.MASKS || panel == ToolPanel.REMOVE) Modifier
@@ -446,7 +511,7 @@ private fun EditorScreen(
         }
         Box(Modifier.fillMaxWidth().height(controlsHeight).background(Color(0xFF111214)).padding(horizontal = 18.dp, vertical = 10.dp)) {
             when (panel) {
-                ToolPanel.ACTIONS -> ActionsPanel(photo, develop, onPhotoUpdate, onCopySettings, onPasteSettings, onDelete, ::change)
+                ToolPanel.ACTIONS -> ActionsPanel(photo, develop, albums, onPhotoUpdate, onCopySettings, onPasteSettings, onToggleAlbum, onCreateAlbum, onDelete, ::change)
                 ToolPanel.PRESETS -> PresetsPanel(develop, builtInPresets + customPresets, favoritePresets, onFavorite, onCreatePreset, ::change)
                 ToolPanel.MASKS -> MaskControls(develop, activeMaskId, { activeMaskId = it }, ::change)
                 ToolPanel.REMOVE -> RemoveControls(develop, activeSpotId, { activeSpotId = it }, ::change)
@@ -466,6 +531,37 @@ private fun EditorScreen(
 }
 
 @Composable
+private fun ExportDialog(options: ExportOptions, onDismiss: () -> Unit, onExport: (ExportOptions) -> Unit) {
+    var quality by remember { mutableFloatStateOf(options.quality.toFloat()) }
+    var maxSide by remember { mutableIntStateOf(options.maxSide) }
+    var format by remember { mutableStateOf(options.format) }
+    Dialog(onDismissRequest = onDismiss) {
+        Surface(color = Panel, shape = RoundedCornerShape(14.dp)) {
+            Column(Modifier.padding(20.dp).width(300.dp)) {
+                Text("EXPORT", color = Accent, fontSize = 11.sp, letterSpacing = 2.sp, fontWeight = FontWeight.Bold)
+                Text("Save to Pictures/LumaRoom", color = Muted, fontSize = 11.sp, modifier = Modifier.padding(bottom = 12.dp))
+                Text("Format", color = Muted, fontSize = 11.sp)
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(vertical = 6.dp)) {
+                    listOf("JPEG", "PNG").forEach { f -> FilterChip(selected = format == f, onClick = { format = f }, label = { Text(f, fontSize = 11.sp) }) }
+                }
+                Text("Max dimension", color = Muted, fontSize = 11.sp, modifier = Modifier.padding(top = 4.dp))
+                Row(Modifier.horizontalScroll(rememberScrollState()).padding(vertical = 6.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    listOf(2048, 3200, 4096, 6000).forEach { s -> FilterChip(selected = maxSide == s, onClick = { maxSide = s }, label = { Text(if (s == 6000) "Max" else "$s", fontSize = 10.sp) }) }
+                }
+                if (format == "JPEG") {
+                    Text("Quality ${quality.toInt()}", color = Muted, fontSize = 11.sp, modifier = Modifier.padding(top = 6.dp))
+                    Slider(quality, { quality = it }, valueRange = 50f..100f, colors = sliderColors())
+                }
+                Row(Modifier.fillMaxWidth().padding(top = 10.dp), horizontalArrangement = Arrangement.End) {
+                    Text("Cancel", color = Muted, fontSize = 12.sp, modifier = Modifier.clickable(onClick = onDismiss).padding(10.dp))
+                    Text("Export", color = Accent, fontSize = 12.sp, fontWeight = FontWeight.Bold, modifier = Modifier.clickable { onExport(ExportOptions(quality.toInt(), maxSide, format)) }.padding(10.dp))
+                }
+            }
+        }
+    }
+}
+
+@Composable
 private fun ActionText(label: String, enabled: Boolean, action: () -> Unit) {
     Text(label, color = if (enabled) Ink else Muted.copy(.35f), fontSize = 23.sp, modifier = Modifier.clickable(enabled = enabled, onClick = action).padding(horizontal = 8.dp))
 }
@@ -478,15 +574,28 @@ private fun previewFilter(state: DevelopState): ColorFilter {
     val contrast = 1f + state.contrast / 100f + state.dehaze / 400f
     val brightness = state.exposure * .19f + state.shadows / 650f + state.whites / 900f + state.blacks / 1000f + state.curveMidtones / 520f + mixLuminance / 1200f
     val curveContrast = (state.curveHighlights - state.curveShadows) / 700f
-    val adjustedContrast = contrast + curveContrast
-    val translate = (1f - adjustedContrast) * .5f + brightness
+    // Approximate the point tone curve in the live preview; export applies the exact LUT.
+    val curveRgb = state.curves["RGB"] ?: emptyList()
+    var pointBrightness = 0f
+    var pointContrast = 0f
+    if (!curveRgb.isIdentityCurve()) {
+        pointBrightness = evaluateCurve(curveRgb, .5f) - .5f
+        pointContrast = ((evaluateCurve(curveRgb, .75f) - evaluateCurve(curveRgb, .25f)) / .5f - 1f) * .8f
+    }
+    fun channelOffset(name: String): Float {
+        val curve = state.curves[name] ?: emptyList()
+        return if (curve.isIdentityCurve()) 0f else (evaluateCurve(curve, .5f) - .5f) * 255f
+    }
+    val adjustedContrast = contrast + curveContrast + pointContrast
+    val translate = (1f - adjustedContrast) * .5f + brightness + pointBrightness
     val warmth = state.temperature / 100f * 25f
     val tint = state.tint / 100f * 15f
     val grade = previewGrade(state)
+    val redOffset = channelOffset("Red"); val greenOffset = channelOffset("Green"); val blueOffset = channelOffset("Blue")
     return ColorFilter.colorMatrix(ColorMatrix(floatArrayOf(
-        adjustedContrast * saturation, 0f, 0f, 0f, translate * 255f + warmth + tint + grade[0],
-        0f, adjustedContrast * saturation, 0f, 0f, translate * 255f - tint + grade[1],
-        0f, 0f, adjustedContrast * saturation, 0f, translate * 255f - warmth + tint + grade[2],
+        adjustedContrast * saturation, 0f, 0f, 0f, translate * 255f + warmth + tint + grade[0] + redOffset,
+        0f, adjustedContrast * saturation, 0f, 0f, translate * 255f - tint + grade[1] + greenOffset,
+        0f, 0f, adjustedContrast * saturation, 0f, translate * 255f - warmth + tint + grade[2] + blueOffset,
         0f, 0f, 0f, 1f, 0f,
     )))
 }
@@ -513,13 +622,17 @@ private fun previewGrade(state: DevelopState): FloatArray {
 private fun ActionsPanel(
     photo: PhotoItem,
     current: DevelopState,
+    albums: Map<String, Set<String>>,
     updatePhoto: (PhotoItem) -> Unit,
     copySettings: (DevelopState) -> Unit,
     pasteSettings: () -> DevelopState?,
+    toggleAlbum: (String, String) -> Unit,
+    createAlbum: (String) -> Unit,
     delete: () -> Unit,
     update: (DevelopState) -> Unit,
 ) {
     val context = LocalContext.current
+    var newAlbum by remember { mutableStateOf("") }
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
         EditorTitle("ACTIONS", "Review, organize, and reuse edits")
         Row(Modifier.fillMaxWidth().padding(top = 9.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -534,11 +647,37 @@ private fun ActionsPanel(
             }
             Spacer(Modifier.weight(1f))
             Text(
-                if (photo.flagged) "⚑ Picked" else "⚐ Flag",
+                if (photo.flagged) "⚑ Pick" else "⚐ Pick",
                 color = if (photo.flagged) WarmAccent else Muted,
                 fontSize = 11.sp,
-                modifier = Modifier.clickable { updatePhoto(photo.copy(flagged = !photo.flagged)) }.padding(8.dp),
+                modifier = Modifier.clickable { updatePhoto(photo.copy(flagged = !photo.flagged, rejected = false)) }.padding(8.dp),
             )
+            Text(
+                "✕ Reject",
+                color = if (photo.rejected) Color(0xFFFF7777) else Muted,
+                fontSize = 11.sp,
+                modifier = Modifier.clickable { updatePhoto(photo.copy(rejected = !photo.rejected, flagged = false)) }.padding(8.dp),
+            )
+        }
+        HorizontalDivider(color = Color.White.copy(.08f), modifier = Modifier.padding(vertical = 10.dp))
+        Text("Albums", color = Muted, fontSize = 11.sp, modifier = Modifier.padding(bottom = 6.dp))
+        Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(7.dp)) {
+            if (albums.isEmpty()) Text("No albums yet", color = Muted, fontSize = 10.sp, modifier = Modifier.padding(vertical = 8.dp))
+            albums.keys.sorted().forEach { album ->
+                val member = albums[album]?.contains(photo.uri) == true
+                FilterChip(selected = member, onClick = { toggleAlbum(album, photo.uri) }, label = { Text(album, fontSize = 10.sp) })
+            }
+        }
+        Row(Modifier.fillMaxWidth().padding(top = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+            OutlinedTextField(
+                value = newAlbum, onValueChange = { newAlbum = it },
+                placeholder = { Text("New album", color = Muted, fontSize = 11.sp) }, singleLine = true,
+                modifier = Modifier.weight(1f),
+            )
+            Text("Create", color = Accent, fontSize = 11.sp, fontWeight = FontWeight.Bold, modifier = Modifier.clickable {
+                val name = newAlbum.trim()
+                if (name.isNotBlank()) { createAlbum(name); toggleAlbum(name, photo.uri); newAlbum = "" }
+            }.padding(10.dp))
         }
         HorizontalDivider(color = Color.White.copy(.08f), modifier = Modifier.padding(vertical = 10.dp))
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -1052,29 +1191,153 @@ private fun LightControls(state: DevelopState, update: (DevelopState) -> Unit) {
 
 @Composable
 private fun CurveControls(state: DevelopState, update: (DevelopState) -> Unit) {
+    var mode by remember { mutableStateOf("Point") }
+    var channel by remember { mutableStateOf("RGB") }
+    val channelColor = mapOf(
+        "RGB" to Ink, "Red" to Color(0xFFE85A5A), "Green" to Color(0xFF65C66A), "Blue" to Color(0xFF5897E8),
+    )
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
-        EditorTitle("TONE CURVE", "Parametric RGB curve")
-        Canvas(Modifier.fillMaxWidth().height(112.dp).background(Color(0xFF181A1D), RoundedCornerShape(7.dp)).padding(8.dp)) {
-            val grid = Color.White.copy(alpha = .10f)
-            for (step in 1..3) {
-                val x = size.width * step / 4f; val y = size.height * step / 4f
-                drawLine(grid, androidx.compose.ui.geometry.Offset(x, 0f), androidx.compose.ui.geometry.Offset(x, size.height), 1f)
-                drawLine(grid, androidx.compose.ui.geometry.Offset(0f, y), androidx.compose.ui.geometry.Offset(size.width, y), 1f)
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                EditorTitle("TONE CURVE", if (mode == "Point") "$channel · drag to shape, long-press node to remove" else "Parametric regions")
             }
-            val points = listOf(
-                androidx.compose.ui.geometry.Offset(0f, size.height),
-                androidx.compose.ui.geometry.Offset(size.width * .25f, size.height * (.75f - state.curveShadows / 240f).coerceIn(0f, 1f)),
-                androidx.compose.ui.geometry.Offset(size.width * .5f, size.height * (.5f - state.curveMidtones / 240f).coerceIn(0f, 1f)),
-                androidx.compose.ui.geometry.Offset(size.width * .75f, size.height * (.25f - state.curveHighlights / 240f).coerceIn(0f, 1f)),
-                androidx.compose.ui.geometry.Offset(size.width, 0f),
-            )
-            val path = Path().apply { moveTo(points.first().x, points.first().y); points.drop(1).forEach { lineTo(it.x, it.y) } }
-            drawPath(path, Accent, style = Stroke(2.dp.toPx()))
-            points.forEach { drawCircle(Ink, 4.dp.toPx(), it) }
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                listOf("Point", "Parametric").forEach { m -> FilterChip(selected = mode == m, onClick = { mode = m }, label = { Text(m, fontSize = 9.sp) }) }
+            }
         }
-        EditorSlider("Shadows", state.curveShadows, -100f..100f, { update(state.copy(curveShadows = it)) })
-        EditorSlider("Midtones", state.curveMidtones, -100f..100f, { update(state.copy(curveMidtones = it)) })
-        EditorSlider("Highlights", state.curveHighlights, -100f..100f, { update(state.copy(curveHighlights = it)) })
+        if (mode == "Parametric") {
+            Canvas(Modifier.fillMaxWidth().height(100.dp).background(Color(0xFF181A1D), RoundedCornerShape(7.dp)).padding(8.dp)) {
+                val grid = Color.White.copy(alpha = .10f)
+                for (step in 1..3) {
+                    val x = size.width * step / 4f; val y = size.height * step / 4f
+                    drawLine(grid, androidx.compose.ui.geometry.Offset(x, 0f), androidx.compose.ui.geometry.Offset(x, size.height), 1f)
+                    drawLine(grid, androidx.compose.ui.geometry.Offset(0f, y), androidx.compose.ui.geometry.Offset(size.width, y), 1f)
+                }
+                val points = listOf(
+                    androidx.compose.ui.geometry.Offset(0f, size.height),
+                    androidx.compose.ui.geometry.Offset(size.width * .25f, size.height * (.75f - state.curveShadows / 240f).coerceIn(0f, 1f)),
+                    androidx.compose.ui.geometry.Offset(size.width * .5f, size.height * (.5f - state.curveMidtones / 240f).coerceIn(0f, 1f)),
+                    androidx.compose.ui.geometry.Offset(size.width * .75f, size.height * (.25f - state.curveHighlights / 240f).coerceIn(0f, 1f)),
+                    androidx.compose.ui.geometry.Offset(size.width, 0f),
+                )
+                val path = Path().apply { moveTo(points.first().x, points.first().y); points.drop(1).forEach { lineTo(it.x, it.y) } }
+                drawPath(path, Accent, style = Stroke(2.dp.toPx()))
+                points.forEach { drawCircle(Ink, 4.dp.toPx(), it) }
+            }
+            EditorSlider("Shadows", state.curveShadows, -100f..100f, { update(state.copy(curveShadows = it)) })
+            EditorSlider("Midtones", state.curveMidtones, -100f..100f, { update(state.copy(curveMidtones = it)) })
+            EditorSlider("Highlights", state.curveHighlights, -100f..100f, { update(state.copy(curveHighlights = it)) })
+        } else {
+            Row(Modifier.horizontalScroll(rememberScrollState()).padding(vertical = 6.dp), horizontalArrangement = Arrangement.spacedBy(7.dp)) {
+                toneCurveChannels.forEach { ch ->
+                    FilterChip(selected = channel == ch, onClick = { channel = ch }, label = { Text(ch, fontSize = 9.sp, color = channelColor.getValue(ch)) })
+                }
+            }
+            PointCurveEditor(state, channel, channelColor.getValue(channel), update)
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                Text("Reset $channel", color = Accent, fontSize = 10.sp, modifier = Modifier.clickable {
+                    val next = state.curves.toMutableMap(); next.remove(channel); update(state.copy(curves = next))
+                }.padding(8.dp))
+            }
+        }
+    }
+}
+
+@Composable
+private fun PointCurveEditor(state: DevelopState, channel: String, lineColor: Color, update: (DevelopState) -> Unit) {
+    val latestState by rememberUpdatedState(state)
+    val latestUpdate by rememberUpdatedState(update)
+    fun pointsOf(s: DevelopState): List<CurvePoint> {
+        val p = s.curves[channel] ?: emptyList()
+        return if (p.isEmpty()) listOf(CurvePoint(0f, 0f), CurvePoint(1f, 1f)) else p.sortedBy { it.x }
+    }
+    fun commit(points: List<CurvePoint>) {
+        val cleaned = points.sortedBy { it.x }
+        val next = latestState.curves.toMutableMap()
+        if (cleaned.isIdentityCurve()) next.remove(channel) else next[channel] = cleaned
+        latestUpdate(latestState.copy(curves = next))
+    }
+    Canvas(
+        Modifier.fillMaxWidth().height(150.dp).background(Color(0xFF181A1D), RoundedCornerShape(7.dp)).padding(8.dp)
+            .pointerInput(channel) {
+                var working = listOf<CurvePoint>()
+                var dragIndex = -1
+                val threshold = 34.dp.toPx() * 34.dp.toPx()
+                detectDragGestures(
+                    onDragStart = { pos ->
+                        val w = size.width.toFloat(); val h = size.height.toFloat()
+                        working = pointsOf(latestState)
+                        var best = -1; var bestDist = Float.MAX_VALUE
+                        working.forEachIndexed { i, p ->
+                            val sx = p.x * w; val sy = (1f - p.y) * h
+                            val d = (pos.x - sx) * (pos.x - sx) + (pos.y - sy) * (pos.y - sy)
+                            if (d < bestDist) { bestDist = d; best = i }
+                        }
+                        if (best >= 0 && bestDist <= threshold) {
+                            dragIndex = best
+                        } else {
+                            val nx = (pos.x / w).coerceIn(0f, 1f); val ny = (1f - pos.y / h).coerceIn(0f, 1f)
+                            working = (working + CurvePoint(nx, ny)).sortedBy { it.x }
+                            dragIndex = working.indexOfFirst { it.x == nx && it.y == ny }
+                            commit(working)
+                        }
+                    },
+                ) { event, _ ->
+                    event.consume()
+                    if (dragIndex < 0 || dragIndex >= working.size) return@detectDragGestures
+                    val w = size.width.toFloat(); val h = size.height.toFloat()
+                    val ny = (1f - event.position.y / h).coerceIn(0f, 1f)
+                    var nx = (event.position.x / w).coerceIn(0f, 1f)
+                    when (dragIndex) {
+                        0 -> nx = 0f
+                        working.size - 1 -> nx = 1f
+                        else -> {
+                            val lo = working[dragIndex - 1].x + .02f
+                            val hi = working[dragIndex + 1].x - .02f
+                            nx = if (lo >= hi) (working[dragIndex - 1].x + working[dragIndex + 1].x) / 2f else nx.coerceIn(lo, hi)
+                        }
+                    }
+                    working = working.toMutableList().also { it[dragIndex] = CurvePoint(nx, ny) }
+                    commit(working)
+                }
+            }
+            .pointerInput(channel) {
+                val threshold = 40.dp.toPx() * 40.dp.toPx()
+                detectTapGestures(onLongPress = { pos ->
+                    val w = size.width.toFloat(); val h = size.height.toFloat()
+                    val pts = pointsOf(latestState)
+                    var best = -1; var bestDist = Float.MAX_VALUE
+                    pts.forEachIndexed { i, p ->
+                        val sx = p.x * w; val sy = (1f - p.y) * h
+                        val d = (pos.x - sx) * (pos.x - sx) + (pos.y - sy) * (pos.y - sy)
+                        if (d < bestDist) { bestDist = d; best = i }
+                    }
+                    if (best > 0 && best < pts.size - 1 && bestDist <= threshold) commit(pts.filterIndexed { i, _ -> i != best })
+                })
+            },
+    ) {
+        val w = size.width; val h = size.height
+        val grid = Color.White.copy(.10f)
+        for (s in 1..3) {
+            val x = w * s / 4f; val y = h * s / 4f
+            drawLine(grid, androidx.compose.ui.geometry.Offset(x, 0f), androidx.compose.ui.geometry.Offset(x, h), 1f)
+            drawLine(grid, androidx.compose.ui.geometry.Offset(0f, y), androidx.compose.ui.geometry.Offset(w, y), 1f)
+        }
+        drawLine(Color.White.copy(.14f), androidx.compose.ui.geometry.Offset(0f, h), androidx.compose.ui.geometry.Offset(w, 0f), 1f)
+        val pts = pointsOf(state)
+        val path = Path()
+        for (i in 0..64) {
+            val t = i / 64f
+            val v = evaluateCurve(pts, t)
+            val sx = t * w; val sy = (1f - v) * h
+            if (i == 0) path.moveTo(sx, sy) else path.lineTo(sx, sy)
+        }
+        drawPath(path, lineColor, style = Stroke(2.dp.toPx()))
+        pts.forEach { p ->
+            val c = androidx.compose.ui.geometry.Offset(p.x * w, (1f - p.y) * h)
+            drawCircle(Color(0xFF181A1D), 5.dp.toPx(), c)
+            drawCircle(lineColor, 5.dp.toPx(), c, style = Stroke(2.dp.toPx()))
+        }
     }
 }
 
@@ -1085,6 +1348,17 @@ private fun ColorControls(state: DevelopState, update: (DevelopState) -> Unit) {
         Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(7.dp)) {
             listOf("Adobe Color", "Adobe Vivid", "Adobe Portrait", "Adobe Neutral", "Monochrome").forEach { profile -> FilterChip(selected = state.profile == profile, onClick = { update(state.copy(profile = profile, saturation = if (profile == "Monochrome") -100f else state.saturation)) }, label = { Text(profile, fontSize = 9.sp) }) }
         }
+        Text("White balance", color = Muted, fontSize = 10.sp, modifier = Modifier.padding(top = 8.dp, bottom = 4.dp))
+        val wbPresets = listOf(
+            "As Shot" to Pair(0f, 0f), "Auto" to Pair(6f, -3f), "Daylight" to Pair(10f, 2f), "Cloudy" to Pair(22f, 6f),
+            "Shade" to Pair(32f, 10f), "Tungsten" to Pair(-38f, 8f), "Fluorescent" to Pair(-18f, 18f), "Flash" to Pair(16f, 4f),
+        )
+        Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(7.dp)) {
+            wbPresets.forEach { (name, tempTint) ->
+                val match = kotlin.math.abs(state.temperature - tempTint.first) < .5f && kotlin.math.abs(state.tint - tempTint.second) < .5f
+                FilterChip(selected = match, onClick = { update(state.copy(temperature = tempTint.first, tint = tempTint.second)) }, label = { Text(name, fontSize = 9.sp) })
+            }
+        }
         EditorSlider("Temperature", state.temperature, -100f..100f, { update(state.copy(temperature = it)) })
         EditorSlider("Tint", state.tint, -100f..100f, { update(state.copy(tint = it)) })
         EditorSlider("Vibrance", state.vibrance, -100f..100f, { update(state.copy(vibrance = it)) })
@@ -1092,14 +1366,17 @@ private fun ColorControls(state: DevelopState, update: (DevelopState) -> Unit) {
     }
 }
 
+private val mixerColors = mapOf(
+    "Red" to Color(0xFFE85A5A), "Orange" to Color(0xFFF39B49), "Yellow" to Color(0xFFE7D451),
+    "Green" to Color(0xFF65C66A), "Aqua" to Color(0xFF54C9C6), "Blue" to Color(0xFF5897E8),
+    "Purple" to Color(0xFF9367D8), "Magenta" to Color(0xFFD85BA7),
+)
+
 @Composable
 private fun ColorMixerControls(state: DevelopState, update: (DevelopState) -> Unit) {
+    if (state.profile == "Monochrome") { BwMixerControls(state, update); return }
     var selected by remember { mutableStateOf("Red") }
-    val colors = mapOf(
-        "Red" to Color(0xFFE85A5A), "Orange" to Color(0xFFF39B49), "Yellow" to Color(0xFFE7D451),
-        "Green" to Color(0xFF65C66A), "Aqua" to Color(0xFF54C9C6), "Blue" to Color(0xFF5897E8),
-        "Purple" to Color(0xFF9367D8), "Magenta" to Color(0xFFD85BA7),
-    )
+    val colors = mixerColors
     val adjustment = state.colorMix[selected] ?: ColorMix()
     fun apply(value: ColorMix) {
         val next = state.colorMix.toMutableMap()
@@ -1122,6 +1399,33 @@ private fun ColorMixerControls(state: DevelopState, update: (DevelopState) -> Un
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
             Text("Reset $selected", color = Accent, fontSize = 10.sp, modifier = Modifier.clickable { apply(ColorMix()) }.padding(8.dp))
         }
+    }
+}
+
+@Composable
+private fun BwMixerControls(state: DevelopState, update: (DevelopState) -> Unit) {
+    var selected by remember { mutableStateOf("Red") }
+    val value = state.bwMix[selected] ?: 0f
+    fun apply(v: Float) {
+        val next = state.bwMix.toMutableMap()
+        if (v == 0f) next.remove(selected) else next[selected] = v
+        update(state.copy(bwMix = next))
+    }
+    Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
+        EditorTitle("B&W MIX", "$selected · gray response per color")
+        Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(vertical = 9.dp), horizontalArrangement = Arrangement.spacedBy(9.dp)) {
+            colorMixChannels.forEach { channel ->
+                Box(
+                    Modifier.size(if (selected == channel) 42.dp else 36.dp).clip(CircleShape).background(mixerColors.getValue(channel)).border(if (selected == channel) 3.dp else 1.dp, if (selected == channel) Ink else Color.White.copy(.28f), CircleShape).clickable { selected = channel },
+                    contentAlignment = Alignment.Center,
+                ) { if (selected == channel) Text("✓", color = Color.Black.copy(.72f), fontWeight = FontWeight.Bold) }
+            }
+        }
+        EditorSlider("Gray", value, -100f..100f, { apply(it) })
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+            Text("Reset mix", color = Accent, fontSize = 10.sp, modifier = Modifier.clickable { update(state.copy(bwMix = emptyMap())) }.padding(8.dp))
+        }
+        Text("Negative darkens, positive lightens how each original color maps to gray.", color = Muted, fontSize = 10.sp, modifier = Modifier.padding(top = 6.dp))
     }
 }
 
@@ -1173,11 +1477,23 @@ private fun EffectsControls(state: DevelopState, update: (DevelopState) -> Unit)
 private fun DetailControls(state: DevelopState, update: (DevelopState) -> Unit) {
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
         EditorTitle("DETAIL", "Sharpening and noise reduction")
-        EditorSlider("Sharpening", state.sharpen, 0f..100f, { update(state.copy(sharpen = it)) })
-        EditorSlider("Noise", state.noiseReduction, 0f..100f, { update(state.copy(noiseReduction = it)) })
+        SubHeader("Sharpening")
+        EditorSlider("Amount", state.sharpen, 0f..100f, { update(state.copy(sharpen = it)) })
+        EditorSlider("Radius", state.sharpenRadius, 0.5f..3f, { update(state.copy(sharpenRadius = it)) }, 1)
+        EditorSlider("Detail", state.sharpenDetail, 0f..100f, { update(state.copy(sharpenDetail = it)) })
+        EditorSlider("Masking", state.sharpenMasking, 0f..100f, { update(state.copy(sharpenMasking = it)) })
+        SubHeader("Noise Reduction")
+        EditorSlider("Luminance", state.noiseReduction, 0f..100f, { update(state.copy(noiseReduction = it)) })
+        EditorSlider("Detail", state.nrDetail, 0f..100f, { update(state.copy(nrDetail = it)) })
+        EditorSlider("Contrast", state.nrContrast, 0f..100f, { update(state.copy(nrContrast = it)) })
         EditorSlider("Color noise", state.colorNoise, 0f..100f, { update(state.copy(colorNoise = it)) })
-        Spacer(Modifier.height(10.dp)); Text("Export rendering uses the full adjustment stack.", color = Muted, fontSize = 11.sp)
+        Spacer(Modifier.height(10.dp)); Text("Masking limits sharpening to edges; NR Detail protects fine texture. Export renders the full stack.", color = Muted, fontSize = 10.sp)
     }
+}
+
+@Composable
+private fun SubHeader(label: String) {
+    Text(label, color = Ink, fontSize = 10.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp, modifier = Modifier.padding(top = 10.dp, bottom = 2.dp))
 }
 
 @Composable

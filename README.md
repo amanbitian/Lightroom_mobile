@@ -5,18 +5,21 @@ An original Android photo library and non-destructive editor inspired by the wor
 ## Implemented
 
 - Persistent multi-photo import using Android document permissions
-- All Photos, Recent, Favorites, and Edited library views
+- All Photos, Recent, Favorites, Rejected, and Edited library views plus user-created Albums
+- Library sort (newest, oldest, name, rating) and adjustable grid density
 - Indexed filename search and a SQLite/WAL-backed catalog that scales beyond a preference file
 - Non-destructive edit recipes saved per photo
-- Debounced autosave/history, undo, redo, reset, copy/paste settings, press-and-hold before/after, ratings, and flags
+- Debounced autosave/history, undo, redo, reset, copy/paste settings, press-and-hold before/after, star ratings, and pick/reject flags
 - Preset browser with Recommended, Favorites, Premium-style, Film, Vintage, B&W, and user categories
 - Up to eight persistent brush, linear, and radial masks with painting or drag positioning, feather, size, flow, angle, invert, and local exposure/contrast/temperature/saturation
 - Favorite presets, save-current-edit as a custom preset, and 0–200 preset strength
 - Profile choices and Light controls: exposure, contrast, highlights, shadows, whites, and blacks
-- Live RGB/luminance histogram and a saved/exported parametric tone curve
-- Color controls: temperature, tint, vibrance, and saturation
+- Live RGB/luminance histogram, a parametric tone curve, and a draggable point tone curve with RGB, Red, Green, and Blue channels (export-accurate LUT)
+- Color controls: white-balance presets, temperature, tint, vibrance, and saturation
+- Eight-channel Black & White mix for the Monochrome profile
 - Effects controls: texture, clarity, dehaze, vignette, and grain
-- Detail controls: sharpening, luminance noise reduction, and color noise recipe storage
+- Detail controls: sharpening amount/radius/detail/masking, luminance noise reduction with detail and contrast, and color noise
+- Export dialog with JPEG/PNG format, adjustable quality, and output size
 - Center crop ratios, 90-degree rotation, and horizontal flip
 - Interactive crop overlay with drag-to-pan, zoom, straighten, aspect ratios, rotation, and matching export geometry
 - Three-way shadow/midtone/highlight color grading with independent hue, saturation, and balance

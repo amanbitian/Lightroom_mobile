@@ -30,30 +30,35 @@ import kotlin.random.Random
 object ImageExporter {
     private data class BrushMaskMap(val width: Int, val height: Int, val alpha: IntArray)
 
-    suspend fun export(context: Context, photo: PhotoItem, state: DevelopState): Uri? = withContext(Dispatchers.IO) {
+    suspend fun export(context: Context, photo: PhotoItem, state: DevelopState, options: ExportOptions = ExportOptions()): Uri? = withContext(Dispatchers.IO) {
         runCatching {
-            val source = decodeScaled(context, Uri.parse(photo.uri), 3200) ?: return@withContext null
+            val isPng = options.format.equals("PNG", ignoreCase = true)
+            val compressFormat = if (isPng) Bitmap.CompressFormat.PNG else Bitmap.CompressFormat.JPEG
+            val quality = options.quality.coerceIn(50, 100)
+            val source = decodeScaled(context, Uri.parse(photo.uri), options.maxSide.coerceIn(512, 6000)) ?: return@withContext null
             val transformed = transform(source, state)
             val healed = applyHealing(transformed, state)
             val adjusted = adjustPixels(healed, state)
-            val fileName = "${photo.name.substringBeforeLast('.').ifBlank { "edit" }}_${System.currentTimeMillis()}.jpg"
+            val extension = if (isPng) "png" else "jpg"
+            val mime = if (isPng) "image/png" else "image/jpeg"
+            val fileName = "${photo.name.substringBeforeLast('.').ifBlank { "edit" }}_${System.currentTimeMillis()}.$extension"
             val result = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 val values = ContentValues().apply {
                     put(MediaStore.Images.Media.DISPLAY_NAME, fileName)
-                    put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+                    put(MediaStore.Images.Media.MIME_TYPE, mime)
                     put(MediaStore.Images.Media.RELATIVE_PATH, "${Environment.DIRECTORY_PICTURES}/LumaRoom")
                     put(MediaStore.Images.Media.IS_PENDING, 1)
                 }
                 val uri = context.contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
                     ?: return@runCatching null
-                context.contentResolver.openOutputStream(uri)?.use { adjusted.compress(Bitmap.CompressFormat.JPEG, 94, it) }
+                context.contentResolver.openOutputStream(uri)?.use { adjusted.compress(compressFormat, quality, it) }
                 values.clear(); values.put(MediaStore.Images.Media.IS_PENDING, 0)
                 context.contentResolver.update(uri, values, null, null)
                 uri
             } else {
                 val directory = File(context.getExternalFilesDir(Environment.DIRECTORY_PICTURES), "LumaRoom").apply { mkdirs() }
                 val file = File(directory, fileName)
-                FileOutputStream(file).use { adjusted.compress(Bitmap.CompressFormat.JPEG, 94, it) }
+                FileOutputStream(file).use { adjusted.compress(compressFormat, quality, it) }
                 Uri.fromFile(file)
             }
             if (source !== transformed) source.recycle()
@@ -155,6 +160,25 @@ object ImageExporter {
             mixLuminance[index] = adjustment.luminance
         }
         val mixEnabled = mixHue.any { it != 0f } || mixSaturation.any { it != 0f } || mixLuminance.any { it != 0f }
+        // Point tone curve lookup tables (master RGB composed with per-channel red/green/blue).
+        val curveRgb = state.curves["RGB"] ?: emptyList()
+        val curveRed = state.curves["Red"] ?: emptyList()
+        val curveGreen = state.curves["Green"] ?: emptyList()
+        val curveBlue = state.curves["Blue"] ?: emptyList()
+        val curvesActive = !curveRgb.isIdentityCurve() || !curveRed.isIdentityCurve() ||
+            !curveGreen.isIdentityCurve() || !curveBlue.isIdentityCurve()
+        val lutR = FloatArray(256); val lutG = FloatArray(256); val lutB = FloatArray(256)
+        if (curvesActive) {
+            for (i in 0..255) {
+                val master = evaluateCurve(curveRgb, i / 255f)
+                lutR[i] = evaluateCurve(curveRed, master)
+                lutG[i] = evaluateCurve(curveGreen, master)
+                lutB[i] = evaluateCurve(curveBlue, master)
+            }
+        }
+        // Black & White channel mix only applies when the Monochrome profile is selected.
+        val bwActive = state.profile == "Monochrome" && state.bwMix.values.any { it != 0f }
+        val bwWeights = FloatArray(8) { index -> state.bwMix[colorMixChannels[index]] ?: 0f }
         val localMasks = state.masks.filter { mask ->
             mask.enabled && (mask.exposure != 0f || mask.contrast != 0f || mask.temperature != 0f || mask.saturation != 0f)
         }
@@ -198,10 +222,27 @@ object ImageExporter {
                 r += state.temperature / 100f * .12f + state.tint / 100f * .04f
                 g -= state.tint / 100f * .08f
                 b -= state.temperature / 100f * .12f - state.tint / 100f * .04f
+                var grayDelta = 0f
+                if (bwActive) {
+                    val maxC = maxOf(r, g, b); val minC = minOf(r, g, b); val d = maxC - minC
+                    if (d > .0001f && maxC > .0001f) {
+                        var h = when (maxC) {
+                            r -> 60f * (((g - b) / d) % 6f)
+                            g -> 60f * ((b - r) / d + 2f)
+                            else -> 60f * ((r - g) / d + 4f)
+                        }
+                        if (h < 0f) h += 360f
+                        val ch = when {
+                            h < 15f || h >= 340f -> 0; h < 45f -> 1; h < 90f -> 2; h < 150f -> 3
+                            h < 210f -> 4; h < 257f -> 5; h < 300f -> 6; else -> 7
+                        }
+                        grayDelta = bwWeights[ch] / 100f * .35f * (d / maxC)
+                    }
+                }
                 luma = .2126f * r + .7152f * g + .0722f * b
-                r = luma + (r - luma) * saturation
-                g = luma + (g - luma) * saturation
-                b = luma + (b - luma) * saturation
+                r = luma + (r - luma) * saturation + grayDelta
+                g = luma + (g - luma) * saturation + grayDelta
+                b = luma + (b - luma) * saturation + grayDelta
                 val shadowWeight = (1f - luma).coerceIn(0f, 1f).pow((2f - balance * .7f).coerceAtLeast(.8f)) * state.shadowGrade / 100f * .34f
                 val highlightWeight = luma.coerceIn(0f, 1f).pow((2f + balance * .7f).coerceAtLeast(.8f)) * state.highlightGrade / 100f * .34f
                 val middleWeight = (1f - abs(luma - .5f) * 2f).coerceIn(0f, 1f) * state.midtoneGrade / 100f * .28f
@@ -297,6 +338,11 @@ object ImageExporter {
                         b = localLuma + (b - localLuma) * localSaturation
                     }
                 }
+                if (curvesActive) {
+                    r = lutR[(r.coerceIn(0f, 1f) * 255f).toInt()]
+                    g = lutG[(g.coerceIn(0f, 1f) * 255f).toInt()]
+                    b = lutB[(b.coerceIn(0f, 1f) * 255f).toInt()]
+                }
                 val dehaze = state.dehaze / 100f * .25f
                 r = (r - .5f) * (1f + dehaze) + .5f
                 g = (g - .5f) * (1f + dehaze) + .5f
@@ -316,8 +362,14 @@ object ImageExporter {
             }
             bitmap.setPixels(pixels, 0, width, 0, top, width, rows)
         }
-        val detailAmount = ((state.sharpen + state.texture * .35f + state.clarity * .25f) / 100f).coerceIn(-.5f, 1.5f)
+        // Sharpening amount is modulated by Detail (fine vs. coarse) and Radius (halo width),
+        // mirroring Lightroom's Detail panel. Texture and Clarity add broad local contrast.
+        val sharpenBase = (state.sharpen / 100f) * (0.4f + state.sharpenDetail / 100f) * (0.7f + state.sharpenRadius * 0.3f)
+        val detailAmount = (sharpenBase + (state.texture * .35f + state.clarity * .25f) / 100f).coerceIn(-.6f, 1.8f)
         val smoothing = (state.noiseReduction / 100f * .65f).coerceIn(0f, .65f)
+        val maskThreshold = state.sharpenMasking / 100f * .18f
+        val nrEdgePreserve = state.nrDetail / 100f
+        val nrLocalContrast = state.nrContrast / 100f * .4f
         if ((abs(detailAmount) > .01f || smoothing > .01f) && width > 2 && height > 2) {
             val detailed = bitmap.copy(Bitmap.Config.ARGB_8888, true)
             var above = IntArray(width); var center = IntArray(width); var below = IntArray(width)
@@ -333,8 +385,12 @@ object ImageExporter {
                     fun refined(shift: Int): Int {
                         val c = channel(color, shift).toFloat()
                         val average = (channel(center[x - 1], shift) + channel(center[x + 1], shift) + channel(above[x], shift) + channel(below[x], shift)) / 4f
-                        val softened = c + (average - c) * smoothing
-                        return (softened + (softened - average) * detailAmount).toInt().coerceIn(0, 255)
+                        val edge = abs(c - average) / 255f
+                        val maskFactor = if (maskThreshold <= 0f) 1f else ((edge - maskThreshold) / .12f).coerceIn(0f, 1f)
+                        val localSmoothing = smoothing * (1f - nrEdgePreserve * (edge * 6f).coerceIn(0f, 1f))
+                        var softened = c + (average - c) * localSmoothing
+                        if (nrLocalContrast > 0f && localSmoothing > 0f) softened = average + (softened - average) * (1f + nrLocalContrast)
+                        return (softened + (softened - average) * detailAmount * maskFactor).toInt().coerceIn(0, 255)
                     }
                     output[x] = (color and -0x1000000) or (refined(16) shl 16) or (refined(8) shl 8) or refined(0)
                 }

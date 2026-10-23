@@ -8,6 +8,7 @@ data class PhotoItem(
     val name: String,
     val rating: Int = 0,
     val flagged: Boolean = false,
+    val rejected: Boolean = false,
     val importedAt: Long = System.currentTimeMillis(),
 )
 
@@ -16,6 +17,36 @@ data class ColorMix(
     val saturation: Float = 0f,
     val luminance: Float = 0f,
 )
+
+/** A single control point on a parametric point curve. x = input, y = output, both 0..1. */
+data class CurvePoint(val x: Float, val y: Float)
+
+val toneCurveChannels = listOf("RGB", "Red", "Green", "Blue")
+
+/**
+ * Evaluates a point curve at [t] (0..1) using piecewise-linear interpolation between the
+ * sorted control points. An empty list behaves as the identity curve (output == input).
+ */
+fun evaluateCurve(points: List<CurvePoint>, t: Float): Float {
+    if (points.isEmpty()) return t.coerceIn(0f, 1f)
+    val sorted = points.sortedBy { it.x }
+    val input = t.coerceIn(0f, 1f)
+    if (input <= sorted.first().x) return sorted.first().y.coerceIn(0f, 1f)
+    if (input >= sorted.last().x) return sorted.last().y.coerceIn(0f, 1f)
+    for (i in 0 until sorted.size - 1) {
+        val a = sorted[i]; val b = sorted[i + 1]
+        if (input in a.x..b.x) {
+            val span = (b.x - a.x).coerceAtLeast(1e-5f)
+            val k = (input - a.x) / span
+            return (a.y + (b.y - a.y) * k).coerceIn(0f, 1f)
+        }
+    }
+    return input
+}
+
+/** A curve channel is "active" when it meaningfully departs from the identity line. */
+fun List<CurvePoint>.isIdentityCurve(): Boolean =
+    isEmpty() || all { kotlin.math.abs(it.y - it.x) < 0.004f }
 
 data class MaskPoint(
     val x: Float,
@@ -81,8 +112,15 @@ data class DevelopState(
     val vignette: Float = 0f,
     val grain: Float = 0f,
     val sharpen: Float = 40f,
+    val sharpenRadius: Float = 1f,
+    val sharpenDetail: Float = 25f,
+    val sharpenMasking: Float = 0f,
     val noiseReduction: Float = 0f,
+    val nrDetail: Float = 50f,
+    val nrContrast: Float = 0f,
     val colorNoise: Float = 25f,
+    val curves: Map<String, List<CurvePoint>> = emptyMap(),
+    val bwMix: Map<String, Float> = emptyMap(),
     val rotation: Int = 0,
     val straighten: Float = 0f,
     val flipHorizontal: Boolean = false,
@@ -98,6 +136,12 @@ data class DevelopState(
     val masks: List<LocalMask> = emptyList(),
     val healingSpots: List<HealingSpot> = emptyList(),
     val profile: String = "Adobe Color",
+)
+
+data class ExportOptions(
+    val quality: Int = 94,
+    val maxSide: Int = 3200,
+    val format: String = "JPEG",
 )
 
 data class Preset(
@@ -177,7 +221,17 @@ fun DevelopState.toJson() = JSONObject().apply {
     put("midtoneHue", midtoneHue); put("midtoneGrade", midtoneGrade); put("highlightHue", highlightHue)
     put("highlightGrade", highlightGrade); put("gradingBalance", gradingBalance); put("texture", texture); put("clarity", clarity)
     put("dehaze", dehaze); put("vignette", vignette); put("grain", grain); put("sharpen", sharpen)
-    put("noiseReduction", noiseReduction); put("colorNoise", colorNoise); put("rotation", rotation); put("straighten", straighten)
+    put("sharpenRadius", sharpenRadius); put("sharpenDetail", sharpenDetail); put("sharpenMasking", sharpenMasking)
+    put("noiseReduction", noiseReduction); put("nrDetail", nrDetail); put("nrContrast", nrContrast)
+    put("colorNoise", colorNoise); put("rotation", rotation); put("straighten", straighten)
+    put("curves", JSONObject().apply {
+        curves.forEach { (channel, points) ->
+            if (points.isNotEmpty()) put(channel, JSONArray().apply {
+                points.forEach { point -> put(JSONObject().apply { put("x", point.x); put("y", point.y) }) }
+            })
+        }
+    })
+    put("bwMix", JSONObject().apply { bwMix.forEach { (channel, value) -> put(channel, value) } })
     put("flipHorizontal", flipHorizontal); put("cropAspect", cropAspect); put("cropZoom", cropZoom)
     put("cropOffsetX", cropOffsetX); put("cropOffsetY", cropOffsetY); put("geometryVertical", geometryVertical)
     put("geometryHorizontal", geometryHorizontal); put("geometryAspect", geometryAspect); put("opticsVignette", opticsVignette)
@@ -256,6 +310,27 @@ private fun masksFromJson(json: JSONArray?): List<LocalMask> {
     }
 }
 
+private fun curvesFromJson(json: JSONObject?): Map<String, List<CurvePoint>> {
+    if (json == null) return emptyMap()
+    return toneCurveChannels.mapNotNull { channel ->
+        val array = json.optJSONArray(channel) ?: return@mapNotNull null
+        val points = (0 until minOf(array.length(), 32)).mapNotNull { index ->
+            val item = array.optJSONObject(index) ?: return@mapNotNull null
+            CurvePoint(item.safeFloat("x").coerceIn(0f, 1f), item.safeFloat("y").coerceIn(0f, 1f))
+        }
+        if (points.isEmpty()) null else channel to points
+    }.toMap()
+}
+
+private fun bwMixFromJson(json: JSONObject?): Map<String, Float> {
+    if (json == null) return emptyMap()
+    return colorMixChannels.mapNotNull { channel ->
+        if (!json.has(channel)) return@mapNotNull null
+        val value = json.safeFloat(channel).coerceIn(-100f, 100f)
+        if (value == 0f) null else channel to value
+    }.toMap()
+}
+
 private fun healingSpotsFromJson(json: JSONArray?): List<HealingSpot> {
     if (json == null) return emptyList()
     return (0 until minOf(json.length(), 24)).mapNotNull { index ->
@@ -289,7 +364,15 @@ fun developStateFromJson(json: JSONObject) = DevelopState(
     texture = json.safeFloat("texture"), clarity = json.safeFloat("clarity"),
     dehaze = json.safeFloat("dehaze"), vignette = json.safeFloat("vignette"),
     grain = json.safeFloat("grain"), sharpen = json.safeFloat("sharpen", 40f),
-    noiseReduction = json.safeFloat("noiseReduction"), colorNoise = json.safeFloat("colorNoise", 25f),
+    sharpenRadius = json.safeFloat("sharpenRadius", 1f).coerceIn(0.5f, 3f),
+    sharpenDetail = json.safeFloat("sharpenDetail", 25f).coerceIn(0f, 100f),
+    sharpenMasking = json.safeFloat("sharpenMasking").coerceIn(0f, 100f),
+    noiseReduction = json.safeFloat("noiseReduction"),
+    nrDetail = json.safeFloat("nrDetail", 50f).coerceIn(0f, 100f),
+    nrContrast = json.safeFloat("nrContrast").coerceIn(0f, 100f),
+    colorNoise = json.safeFloat("colorNoise", 25f),
+    curves = curvesFromJson(json.optJSONObject("curves")),
+    bwMix = bwMixFromJson(json.optJSONObject("bwMix")),
     rotation = json.optInt("rotation"), straighten = json.safeFloat("straighten"), flipHorizontal = json.optBoolean("flipHorizontal"),
     cropAspect = json.optString("cropAspect", "Original"), cropZoom = json.safeFloat("cropZoom", 1f).coerceIn(1f, 3f),
     cropOffsetX = json.safeFloat("cropOffsetX").coerceIn(-1f, 1f), cropOffsetY = json.safeFloat("cropOffsetY").coerceIn(-1f, 1f),

@@ -21,10 +21,13 @@ class LibraryStore(private val context: Context) {
             val name = cursor.getColumnIndexOrThrow("name")
             val rating = cursor.getColumnIndexOrThrow("rating")
             val flagged = cursor.getColumnIndexOrThrow("flagged")
+            val rejected = cursor.getColumnIndex("rejected")
             val importedAt = cursor.getColumnIndexOrThrow("imported_at")
             while (cursor.moveToNext()) result += PhotoItem(
                 uri = cursor.getString(uri), name = cursor.getString(name), rating = cursor.getInt(rating),
-                flagged = cursor.getInt(flagged) == 1, importedAt = cursor.getLong(importedAt),
+                flagged = cursor.getInt(flagged) == 1,
+                rejected = rejected >= 0 && cursor.getInt(rejected) == 1,
+                importedAt = cursor.getLong(importedAt),
             )
         }
         return result
@@ -90,7 +93,7 @@ class LibraryStore(private val context: Context) {
             val array = JSONArray(prefs.getString("photos", "[]"))
             val legacy = List(array.length()) { index ->
                 val item = array.getJSONObject(index)
-                PhotoItem(item.getString("uri"), item.optString("name", "Photo ${index + 1}"), item.optInt("rating"), item.optBoolean("flagged"), item.optLong("importedAt", System.currentTimeMillis()))
+                PhotoItem(item.getString("uri"), item.optString("name", "Photo ${index + 1}"), item.optInt("rating"), item.optBoolean("flagged"), importedAt = item.optLong("importedAt", System.currentTimeMillis()))
             }
             savePhotos(legacy)
             legacy.forEach { photo ->
@@ -105,18 +108,47 @@ class LibraryStore(private val context: Context) {
     }
 
     private fun PhotoItem.values() = ContentValues().apply {
-        put("uri", uri); put("name", name); put("rating", rating); put("flagged", if (flagged) 1 else 0); put("imported_at", importedAt)
+        put("uri", uri); put("name", name); put("rating", rating); put("flagged", if (flagged) 1 else 0)
+        put("rejected", if (rejected) 1 else 0); put("imported_at", importedAt)
+    }
+
+    // Albums are a light many-to-many membership kept in preferences: { "Album": ["uri", ...] }.
+    fun loadAlbums(): Map<String, Set<String>> = runCatching {
+        val root = JSONObject(prefs.getString("albums", "{}"))
+        root.keys().asSequence().associateWith { key ->
+            val array = root.getJSONArray(key)
+            (0 until array.length()).map { array.getString(it) }.toSet()
+        }
+    }.getOrDefault(emptyMap())
+
+    fun saveAlbums(albums: Map<String, Set<String>>) {
+        val root = JSONObject()
+        albums.forEach { (name, uris) -> root.put(name, JSONArray().apply { uris.forEach { put(it) } }) }
+        prefs.edit().putString("albums", root.toString()).apply()
+    }
+
+    fun loadExportOptions(): ExportOptions = ExportOptions(
+        quality = prefs.getInt("exportQuality", 94).coerceIn(50, 100),
+        maxSide = prefs.getInt("exportMaxSide", 3200).coerceIn(1024, 6000),
+        format = prefs.getString("exportFormat", "JPEG") ?: "JPEG",
+    )
+
+    fun saveExportOptions(options: ExportOptions) {
+        prefs.edit().putInt("exportQuality", options.quality).putInt("exportMaxSide", options.maxSide)
+            .putString("exportFormat", options.format).apply()
     }
 }
 
-private class CatalogDatabase(context: Context) : SQLiteOpenHelper(context, "lumaroom_catalog.db", null, 1) {
+private class CatalogDatabase(context: Context) : SQLiteOpenHelper(context, "lumaroom_catalog.db", null, 2) {
     override fun onCreate(db: SQLiteDatabase) {
-        db.execSQL("CREATE TABLE photos(uri TEXT PRIMARY KEY NOT NULL, name TEXT NOT NULL, rating INTEGER NOT NULL DEFAULT 0, flagged INTEGER NOT NULL DEFAULT 0, imported_at INTEGER NOT NULL)")
+        db.execSQL("CREATE TABLE photos(uri TEXT PRIMARY KEY NOT NULL, name TEXT NOT NULL, rating INTEGER NOT NULL DEFAULT 0, flagged INTEGER NOT NULL DEFAULT 0, rejected INTEGER NOT NULL DEFAULT 0, imported_at INTEGER NOT NULL)")
         db.execSQL("CREATE TABLE edits(uri TEXT PRIMARY KEY NOT NULL, recipe TEXT NOT NULL, updated_at INTEGER NOT NULL, FOREIGN KEY(uri) REFERENCES photos(uri) ON DELETE CASCADE)")
         db.execSQL("CREATE INDEX photos_imported_at ON photos(imported_at DESC)")
         db.execSQL("CREATE INDEX photos_rating ON photos(rating DESC)")
         db.execSQL("CREATE INDEX edits_updated_at ON edits(updated_at DESC)")
     }
-    override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) = Unit
+    override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
+        if (oldVersion < 2) db.execSQL("ALTER TABLE photos ADD COLUMN rejected INTEGER NOT NULL DEFAULT 0")
+    }
     override fun onConfigure(db: SQLiteDatabase) { super.onConfigure(db); db.setForeignKeyConstraintsEnabled(true); db.enableWriteAheadLogging() }
 }
