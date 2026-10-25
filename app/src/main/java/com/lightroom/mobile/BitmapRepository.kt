@@ -26,18 +26,8 @@ object BitmapRepository {
         cache.get(key)?.takeUnless { it.isRecycled } ?: decode(context, uri, bucket)?.also { cache.put(key, it) }
     }
 
-    private fun decode(context: Context, uri: Uri, maxSide: Int): Bitmap? {
-        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-        context.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
-        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
-        var sample = 1
-        while (max(bounds.outWidth, bounds.outHeight) / (sample * 2) >= maxSide) sample *= 2
-        val options = BitmapFactory.Options().apply {
-            inSampleSize = sample
-            inPreferredConfig = Bitmap.Config.ARGB_8888
-        }
-        return context.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, options) }
-    }
+    private fun decode(context: Context, uri: Uri, maxSide: Int): Bitmap? =
+        RawDecoder.decode(context, uri, maxSide)
 
     fun clear() = cache.evictAll()
 }

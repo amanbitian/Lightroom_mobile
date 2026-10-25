@@ -1,7 +1,6 @@
 package com.lightroom.mobile
 
 import android.graphics.Bitmap
-import android.net.Uri
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
@@ -15,7 +14,6 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.Stroke
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -25,10 +23,9 @@ import kotlin.math.ln
 private data class HistogramData(val red: IntArray, val green: IntArray, val blue: IntArray, val luminance: IntArray, val peak: Int)
 
 @Composable
-fun HistogramOverlay(photo: PhotoItem, modifier: Modifier = Modifier) {
-    val context = LocalContext.current
-    val data by produceState<HistogramData?>(null, photo.uri) {
-        val bitmap = BitmapRepository.load(context, Uri.parse(photo.uri), 384)
+fun HistogramOverlay(bitmap: Bitmap?, modifier: Modifier = Modifier) {
+    // Computed from the rendered preview, so it reflects the edit rather than the original file.
+    val data by produceState<HistogramData?>(null, bitmap) {
         value = withContext(Dispatchers.Default) { bitmap?.histogram() }
     }
     Box(modifier.size(142.dp, 72.dp).clip(RoundedCornerShape(6.dp)).background(Color.Black.copy(alpha = .58f))) {
