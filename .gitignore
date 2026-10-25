@@ -7,3 +7,8 @@ local.properties
 .externalNativeBuild/
 .cxx/
 app/build/
+
+# Signing key and generated APKs (keep private)
+*.keystore
+*.apk
+.kotlin/
