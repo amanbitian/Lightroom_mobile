@@ -11,6 +11,7 @@ import kotlin.math.max
 
 /** Memory-bounded, sampled bitmap cache shared by the library and editor. */
 object BitmapRepository {
+    val revision = kotlinx.coroutines.flow.MutableStateFlow(0L)
     private val cacheSizeKb = (Runtime.getRuntime().maxMemory() / 1024L / 8L).toInt()
     private val cache = object : LruCache<String, Bitmap>(cacheSizeKb) {
         override fun sizeOf(key: String, value: Bitmap): Int = value.allocationByteCount / 1024
@@ -29,5 +30,5 @@ object BitmapRepository {
     private fun decode(context: Context, uri: Uri, maxSide: Int): Bitmap? =
         RawDecoder.decode(context, uri, maxSide)
 
-    fun clear() = cache.evictAll()
+    fun clear() { cache.evictAll(); revision.value++ }
 }

@@ -109,6 +109,9 @@ object Inpainter {
         _status.value = Status.NotInstalled
     }
 
+    /** A memory failure keeps the verified model; a missing/corrupt model needs a fresh download. */
+    fun retryOrDownload() { if (modelFile().exists()) refresh() else download() }
+
     /**
      * Regenerates [region] of [image] in place. Returns false (leaving the image untouched) when the model isn't
      * installed or inference fails, so the caller can use its fallback.
@@ -169,7 +172,11 @@ object Inpainter {
         // A corrupt or incompatible model makes loading/inference throw: drop it and mark failed so the
         // Retouch card offers a fresh download instead of silently staying "installed".
         synchronized(this) { interpreter?.close(); interpreter = null }
-        if (error !is kotlinx.coroutines.CancellationException) { modelFile().delete(); _status.value = Status.Failed("AI model was unreadable — download it again") }
+        if (error is OutOfMemoryError) {
+            _status.value = Status.Failed("Not enough memory for AI Remove. Try a smaller photo or another device; the model is still installed")
+        } else if (error !is kotlinx.coroutines.CancellationException) {
+            modelFile().delete(); _status.value = Status.Failed("AI model was unreadable — download it again")
+        }
         false
     }.also { scheduleRelease() }
 

@@ -3,3 +3,5 @@
 # Keep line numbers so crash reports from release builds stay readable.
 -keepattributes SourceFile,LineNumberTable
 -renamesourcefileattribute SourceFile
+-keep class com.lightroom.mobile.NativeRaw { *; }
+-keep class com.lightroom.mobile.RawFrame { *; }

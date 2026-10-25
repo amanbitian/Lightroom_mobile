@@ -95,6 +95,7 @@ import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -238,6 +239,7 @@ private fun LumaRoomApp() {
             val newly = added.filter { item -> photos.none { it.uri == item.uri } }
             newly.forEach { photos.add(0, it) }
             withContext(Dispatchers.IO) { store.savePhotos(photos.toList()) }
+            withContext(Dispatchers.IO) { newly.forEach { item -> store.saveMetadata(item.uri, PhotoMetadataIO.read(context, Uri.parse(item.uri))) } }
             val skipped = added.size - newly.size
             val message = when {
                 newly.isEmpty() && skipped > 0 -> if (skipped == 1) "Already imported" else "$skipped already imported"
@@ -363,6 +365,12 @@ private fun LumaRoomApp() {
                             isEdited = { it in editedUris },
                             editStamp = { editStamps[it] ?: 0L },
                             loadEdit = { uri -> withContext(Dispatchers.IO) { store.loadEdit(uri) } },
+                            metadata = store.allMetadata(),
+                            presets = builtInPresets + assetPresets + customPresets,
+                            onBatchChanged = {
+                                editedUris = store.editedUris()
+                                editStamps = photos.associate { it.uri to System.nanoTime() }
+                            },
                             modifier = Modifier.padding(padding),
                             onImportGallery = importGallery, onImportFiles = importFiles,
                             onPhotoClick = { selectedPhoto = it; editing = true; tab = AppTab.EDIT },
@@ -415,7 +423,10 @@ private fun LibraryScreen(
     photos: List<PhotoItem>, albums: Map<String, Set<String>>, isEdited: (String) -> Boolean,
     editStamp: (String) -> Long, loadEdit: suspend (String) -> DevelopState, modifier: Modifier = Modifier,
     onImportGallery: () -> Unit, onImportFiles: () -> Unit, onPhotoClick: (PhotoItem) -> Unit,
+    metadata: Map<String, PhotoMetadata> = emptyMap(), presets: List<Preset> = emptyList(), onBatchChanged: () -> Unit = {},
 ) {
+    var selecting by remember { mutableStateOf(false) }
+    var selection by remember { mutableStateOf(setOf<String>()) }
     var filter by remember { mutableStateOf("All Photos") }
     var search by remember { mutableStateOf("") }
     var sort by remember { mutableStateOf("Newest") }
@@ -430,7 +441,7 @@ private fun LibraryScreen(
         "All Photos" -> photos
         else -> albums[filter]?.let { members -> photos.filter { it.uri in members } } ?: photos
     }
-    val searched = if (search.isBlank()) filtered else filtered.filter { it.name.contains(search.trim(), ignoreCase = true) }
+    val searched = if (search.isBlank()) filtered else filtered.filter { it.name.contains(search.trim(), ignoreCase = true) || metadata[it.uri]?.matches(search.trim()) == true }
     val visible = when (sort) {
         "Oldest" -> searched.sortedBy { it.importedAt }
         "Name" -> searched.sortedBy { it.name.lowercase() }
@@ -478,10 +489,16 @@ private fun LibraryScreen(
                 }
             }
         }
+        Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp)) {
+            TextButton(onClick = { selecting = !selecting; if (!selecting) selection = emptySet() }) { Text(if (selecting) "Done selecting" else "Select photos") }
+            if (selecting) TextButton(onClick = { selection = selection + visible.map { it.uri } }) { Text("Select visible") }
+            if (selecting) TextButton(onClick = { selection = emptySet() }) { Text("Clear") }
+        }
+        if (selecting) BatchTools(photos.filter { it.uri in selection }, presets, onBatchChanged)
         if (searching) OutlinedTextField(
             value = search,
             onValueChange = { search = it },
-            placeholder = { Text("Search by filename", fontSize = 13.sp) },
+            placeholder = { Text("Filename, caption, keyword, camera or location", fontSize = 13.sp) },
             leadingIcon = { Icon(Icons.Filled.Search, null, tint = Muted) },
             singleLine = true,
             shape = RoundedCornerShape(12.dp),
@@ -515,7 +532,11 @@ private fun LibraryScreen(
                 modifier = Modifier.weight(1f),
             ) {
                 items(visible, key = { it.uri }) { photo ->
-                    PhotoTile(photo, isEdited(photo.uri), editStamp(photo.uri), loadEdit, showName = density == 2) { onPhotoClick(photo) }
+                    Box {
+                        val toggle = { selection = if (photo.uri in selection) selection - photo.uri else selection + photo.uri }
+                        PhotoTile(photo, isEdited(photo.uri), editStamp(photo.uri), loadEdit, showName = density == 2) { if (selecting) toggle() else onPhotoClick(photo) }
+                        if (selecting) Checkbox(checked = photo.uri in selection, onCheckedChange = { toggle() }, modifier = Modifier.align(Alignment.TopEnd).semantics { contentDescription = "Select ${photo.name}" })
+                    }
                 }
             }
         }
@@ -552,14 +573,16 @@ private fun EmptyLibrary(onImportGallery: () -> Unit, onImportFiles: () -> Unit,
 @Composable
 private fun PhotoTile(photo: PhotoItem, edited: Boolean, stamp: Long, loadEdit: suspend (String) -> DevelopState, showName: Boolean, onClick: () -> Unit) {
     Box(Modifier.aspectRatio(1f).clickable(onClick = onClick), contentAlignment = Alignment.BottomStart) {
+        val bitmapRevision by BitmapRepository.revision.collectAsState()
+        val thumbnailStamp = stamp xor bitmapRevision
         val tileModifier = Modifier.fillMaxSize().then(if (photo.rejected) Modifier.graphicsLayer(alpha = .4f) else Modifier)
         // Edited photos show their edit, like Lightroom's grid (rendered small, cached until the next save).
         val context = LocalContext.current
-        val editedThumb by produceState<Bitmap?>(EditedThumbnails.get(photo.uri, stamp), photo.uri, edited, stamp) {
+        val editedThumb by produceState<Bitmap?>(EditedThumbnails.get(photo.uri, thumbnailStamp), photo.uri, edited, thumbnailStamp) {
             if (!edited) { value = null; return@produceState }
-            EditedThumbnails.get(photo.uri, stamp)?.let { value = it; return@produceState }
+            EditedThumbnails.get(photo.uri, thumbnailStamp)?.let { value = it; return@produceState }
             val source = BitmapRepository.load(context, Uri.parse(photo.uri), 384) ?: return@produceState
-            value = runCatching { ImageExporter.renderEdited(source, loadEdit(photo.uri)) }.getOrNull()?.also { EditedThumbnails.put(photo.uri, stamp, it) }
+            value = runCatching { ImageExporter.renderEdited(source, loadEdit(photo.uri)) }.getOrNull()?.also { EditedThumbnails.put(photo.uri, thumbnailStamp, it) }
         }
         val thumb = editedThumb
         if (thumb != null) Image(thumb.asImageBitmap(), photo.name, tileModifier, contentScale = ContentScale.Crop)
@@ -588,7 +611,8 @@ private object EditedThumbnails {
 @Composable
 private fun PhotoBitmap(photo: PhotoItem, modifier: Modifier = Modifier, colorFilter: ColorFilter? = null, contentScale: ContentScale = ContentScale.Crop, requestedSide: Int = 512) {
     val context = LocalContext.current
-    val bitmap by produceState<Bitmap?>(null, photo.uri, requestedSide) {
+    val revision by BitmapRepository.revision.collectAsState()
+    val bitmap by produceState<Bitmap?>(null, photo.uri, requestedSide, revision) {
         value = BitmapRepository.load(context, Uri.parse(photo.uri), requestedSide)
     }
     // While decoding, a neutral tile (the illustrated placeholder looked like a wrong photo).
@@ -634,7 +658,7 @@ private fun EmptyEditState(modifier: Modifier = Modifier, importGallery: () -> U
 
 @Composable
 private fun SettingsScreen(photoCount: Int, modifier: Modifier = Modifier) {
-    Column(modifier.fillMaxSize().padding(20.dp)) {
+    Column(modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(20.dp)) {
         Spacer(Modifier.height(18.dp)); Text("SETTINGS", color = Accent, fontSize = 11.sp, letterSpacing = 2.6.sp, fontWeight = FontWeight.Bold)
         BrandLogo(Modifier.padding(top = 12.dp).size(170.dp, 139.dp)); Spacer(Modifier.height(20.dp))
         val context = LocalContext.current
@@ -652,6 +676,7 @@ private fun SettingsScreen(photoCount: Int, modifier: Modifier = Modifier) {
         )
         SettingsRow("Privacy", "No account · no telemetry · photos never leave the device (network is used only for the optional AI model download)")
         SettingsRow("About", "Version $version · Kotlin + Jetpack Compose · LiteRT")
+        ThirdPartyLicenses()
     }
 }
 
@@ -683,7 +708,8 @@ private fun EditorScreen(
     val configuration = LocalConfiguration.current
     val scope = rememberCoroutineScope()
     // null while loading; a Result so a decode failure (missing/unsupported/revoked URI) is distinct from loading.
-    val loadResult by produceState<Result<Bitmap>?>(null, photo.uri) {
+    val bitmapRevision by BitmapRepository.revision.collectAsState()
+    val loadResult by produceState<Result<Bitmap>?>(null, photo.uri, bitmapRevision) {
         value = runCatching { BitmapRepository.load(context, Uri.parse(photo.uri), 1600) ?: error("This photo couldn't be opened") }
     }
     val editorBitmap = loadResult?.getOrNull()
@@ -703,6 +729,9 @@ private fun EditorScreen(
     var showMask by remember(photo.uri) { mutableStateOf(false) }
     // Auto-peek: briefly flash that overlay when you pick or adjust a mask, so it's discoverable without the toggle.
     var maskPeek by remember(photo.uri) { mutableStateOf(false) }
+    // Guided Upright (#17): draw reference lines, then solve them into the geometry straighten/keystone.
+    var guidedMode by remember(photo.uri) { mutableStateOf(false) }
+    var guides by remember(photo.uri) { mutableStateOf(emptyList<GuidedUpright.Guide>()) }
     var historyJob by remember { mutableStateOf<Job?>(null) }
     // A preset is only a preview until the user taps Apply; `previewBase` is the look before the preview so Cancel
     // restores it exactly. Applied presets are recorded on the photo (presetId + presetBase), so tapping the applied
@@ -852,7 +881,7 @@ private fun EditorScreen(
         val cropMode = panel == ToolPanel.CROP && !compare
         BoxWithConstraints(
             Modifier.fillMaxWidth().weight(1f).background(Color(0xFF202124)).padding(10.dp).then(
-                if (panel == ToolPanel.CROP || panel == ToolPanel.MASKS || panel == ToolPanel.REMOVE || panel == ToolPanel.BLUR) Modifier
+                if (panel == ToolPanel.CROP || panel == ToolPanel.MASKS || panel == ToolPanel.REMOVE || panel == ToolPanel.BLUR || (panel == ToolPanel.GEOMETRY && guidedMode)) Modifier
                 else Modifier.pointerInput(photo.uri) { detectTapGestures(onPress = { compare = true; tryAwaitRelease(); compare = false }) }
             ),
             contentAlignment = Alignment.Center,
@@ -897,6 +926,7 @@ private fun EditorScreen(
                 }
                 if (!compare && !cropMode) VignetteOverlay(develop)
                 if (cropMode) CropGuide(develop, view.frameAspect, ::change)
+                if (!compare && panel == ToolPanel.GEOMETRY && guidedMode) GuidedUprightGuide(guides, orientedAspect(imageAspect, develop.rotation)) { guides = (guides + it).takeLast(4) }
             }
             if (!compare && showHistogram) HistogramOverlay(rendered ?: editorBitmap, Modifier.align(Alignment.TopEnd).padding(2.dp))
             val previewHint = when {
@@ -954,7 +984,20 @@ private fun EditorScreen(
                     ToolPanel.MASKS -> MaskControls(develop, activeMaskId, { activeMaskId = it }, ::change, showMask, { showMask = it })
                     ToolPanel.REMOVE -> RemoveControls(develop, activeSpotId, { activeSpotId = it }, ::change)
                     ToolPanel.CROP -> CropControls(develop, orientedAspect(imageAspect, develop.rotation), ::change)
-                    ToolPanel.GEOMETRY -> GeometryControls(develop, ::change)
+                    ToolPanel.GEOMETRY -> GeometryControls(
+                        develop, ::change, guidedMode = guidedMode, guideCount = guides.size,
+                        onGuided = { on ->
+                            guidedMode = on
+                            // Draw on the un-warped frame: reset geometry so the guides are measured against the raw photo.
+                            if (on) { guides = emptyList(); change(develop.copy(straighten = 0f, geometryVertical = 0f, geometryHorizontal = 0f)) }
+                        },
+                        onApplyGuides = {
+                            val (st, gv, gh) = GuidedUpright.solve(guides, orientedAspect(imageAspect, develop.rotation))
+                            change(develop.copy(straighten = st, geometryVertical = gv, geometryHorizontal = gh))
+                            guides = emptyList(); guidedMode = false
+                        },
+                        onClearGuides = { guides = emptyList() },
+                    )
                     ToolPanel.LIGHT -> LightControls(develop, ::change)
                     ToolPanel.CURVE -> CurveControls(develop, ::change)
                     ToolPanel.COLOR -> ColorControls(develop, ::change)
@@ -972,13 +1015,15 @@ private fun EditorScreen(
 }
 
 @Composable
-private fun ExportDialog(options: ExportOptions, onDismiss: () -> Unit, onExport: (ExportOptions) -> Unit) {
+internal fun ExportDialog(options: ExportOptions, onDismiss: () -> Unit, onExport: (ExportOptions) -> Unit) {
     var quality by remember { mutableFloatStateOf(options.quality.toFloat()) }
     var maxSide by remember { mutableIntStateOf(options.maxSide) }
     var format by remember { mutableStateOf(options.format) }
+    var includeMetadata by remember { mutableStateOf(options.includeMetadata) }
+    var includeLocation by remember { mutableStateOf(options.includeLocation) }
     Dialog(onDismissRequest = onDismiss) {
         Surface(color = Panel, shape = RoundedCornerShape(14.dp)) {
-            Column(Modifier.padding(20.dp).width(300.dp)) {
+            Column(Modifier.padding(20.dp).width(300.dp).heightIn(max = 580.dp).verticalScroll(rememberScrollState())) {
                 Text("EXPORT", color = Accent, fontSize = 11.sp, letterSpacing = 2.sp, fontWeight = FontWeight.Bold)
                 Text("Save to Pictures/LumaRoom", color = Muted, fontSize = 11.sp, modifier = Modifier.padding(bottom = 12.dp))
                 Text("Format", color = Muted, fontSize = 11.sp)
@@ -998,8 +1043,10 @@ private fun ExportDialog(options: ExportOptions, onDismiss: () -> Unit, onExport
                 }
                 Row(Modifier.fillMaxWidth().padding(top = 10.dp), horizontalArrangement = Arrangement.End) {
                     Text("Cancel", color = Muted, fontSize = 12.sp, modifier = Modifier.clickable(onClick = onDismiss).padding(10.dp))
-                    Text("Export", color = Accent, fontSize = 12.sp, fontWeight = FontWeight.Bold, modifier = Modifier.clickable { onExport(ExportOptions(quality.toInt(), maxSide, format)) }.padding(10.dp))
+                    Text("Export", color = Accent, fontSize = 12.sp, fontWeight = FontWeight.Bold, modifier = Modifier.clickable { onExport(ExportOptions(quality.toInt(), maxSide, format, includeMetadata, includeMetadata && includeLocation)) }.padding(10.dp))
                 }
+                Row(verticalAlignment = Alignment.CenterVertically) { Checkbox(includeMetadata, { includeMetadata = it }); Text("Include caption, copyright, keywords & EXIF", fontSize = 11.sp) }
+                Row(verticalAlignment = Alignment.CenterVertically) { Checkbox(includeLocation, { includeLocation = it }, enabled = includeMetadata); Text("Include location", fontSize = 11.sp) }
             }
         }
     }
@@ -1104,6 +1151,7 @@ private fun ActionsPanel(
     var newAlbum by remember { mutableStateOf("") }
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
         EditorTitle("ACTIONS", "Review, organize, and reuse edits")
+        WorkflowTools(photo, current, update)
         Row(Modifier.fillMaxWidth().padding(top = 9.dp), verticalAlignment = Alignment.CenterVertically) {
             Text("Rating", color = Muted, fontSize = 11.sp, modifier = Modifier.width(72.dp))
             (1..5).forEach { star ->
@@ -1347,6 +1395,7 @@ private fun MaskControls(
         update(state.copy(masks = state.masks.map { if (it.id == mask.id) mask else it }))
     }
     val active = state.masks.firstOrNull { it.id == activeId } ?: state.masks.lastOrNull()
+    val faceMessage by FaceRegionSegmenter.message.collectAsState()
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) { EditorTitle("MASKING", "Local, feathered adjustments") }
@@ -1366,6 +1415,11 @@ private fun MaskControls(
             ToolButton("+ Hair") { add("Hair") }
             ToolButton("+ Skin") { add("Skin") }
             ToolButton("+ Clothes") { add("Clothes") }
+            ToolButton("+ Face") { add("Face") }
+            ToolButton("+ Eyes") { add("Eyes") }
+            ToolButton("+ Brows") { add("Eyebrows") }
+            ToolButton("+ Lips") { add("Lips") }
+            ToolButton("+ Teeth*") { add("Teeth") }
         }
         if (state.masks.isEmpty()) {
             Text("Add a brush, linear, or radial mask. Paint or position it directly on the photo.", color = Muted, fontSize = 11.sp, modifier = Modifier.padding(top = 14.dp))
@@ -1381,14 +1435,27 @@ private fun MaskControls(
             }
         }
         if (active != null) {
+            if (active.type in faceMaskTypes && faceMessage != null) Text(faceMessage!!, color = Color(0xFFFFB74D), fontSize = 10.sp)
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
                 FilterChip(selected = active.enabled, onClick = { replace(active.copy(enabled = !active.enabled)) }, label = { Text(if (active.enabled) "Enabled" else "Disabled", fontSize = 9.sp) })
                 FilterChip(selected = active.invert, onClick = { replace(active.copy(invert = !active.invert)) }, label = { Text("Invert", fontSize = 9.sp) })
                 Spacer(Modifier.weight(1f))
-                Text("Delete", color = Color(0xFFFF7777), fontSize = 10.sp, modifier = Modifier.clickable {
-                    val remaining = state.masks.filterNot { it.id == active.id }
+                val activeIndex = state.masks.indexOfFirst { it.id == active.id }
+                val groupEnd = (activeIndex + 1 until state.masks.size).firstOrNull { state.masks[it].combine == "New" } ?: state.masks.size
+                val deleteGroup = active.combine == "New" && groupEnd > activeIndex + 1
+                Text(if (deleteGroup) "Delete group" else "Delete", color = Color(0xFFFF7777), fontSize = 10.sp, modifier = Modifier.clickable {
+                    val removed = if (deleteGroup) state.masks.subList(activeIndex, groupEnd).map { it.id }.toSet() else setOf(active.id)
+                    val remaining = state.masks.filterNot { it.id in removed }
                     update(state.copy(masks = remaining)); select(remaining.lastOrNull()?.id)
                 }.padding(8.dp))
+            }
+            // Compound masking (#7): make this mask Add/Subtract/Intersect with the mask above it, or keep it standalone.
+            if (state.masks.firstOrNull()?.id != active.id) {
+                Row(Modifier.horizontalScroll(rememberScrollState()).padding(top = 2.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    listOf("New", "Add", "Subtract", "Intersect").forEach { op ->
+                        FilterChip(selected = active.combine == op, onClick = { replace(active.copy(combine = op)) }, label = { Text(op, fontSize = 9.sp) })
+                    }
+                }
             }
             if (active.type == "Brush" && active.brushStrokes.isNotEmpty()) {
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
@@ -1397,13 +1464,25 @@ private fun MaskControls(
                 }
             }
             val aiMask = active.type in aiMaskTypes
-            EditorSlider("Exposure", active.exposure, -4f..4f, { replace(active.copy(exposure = it)) }, 2)
-            EditorSlider("Contrast", active.contrast, -100f..100f, { replace(active.copy(contrast = it)) })
-            EditorSlider("Temp", active.temperature, -100f..100f, { replace(active.copy(temperature = it)) }, gradient = TempTrack)
-            EditorSlider("Highlights", active.highlights, -100f..100f, { replace(active.copy(highlights = it)) })
-            EditorSlider("Shadows", active.shadows, -100f..100f, { replace(active.copy(shadows = it)) })
-            EditorSlider("Tint", active.tint, -100f..100f, { replace(active.copy(tint = it)) }, gradient = TintTrack)
-            EditorSlider("Saturation", active.saturation, -100f..100f, { replace(active.copy(saturation = it)) }, gradient = SaturationTrack)
+            if (active.combine == "New") {
+                EditorSlider("Exposure", active.exposure, -4f..4f, { replace(active.copy(exposure = it)) }, 2)
+                EditorSlider("Contrast", active.contrast, -100f..100f, { replace(active.copy(contrast = it)) })
+                EditorSlider("Temp", active.temperature, -100f..100f, { replace(active.copy(temperature = it)) }, gradient = TempTrack)
+                EditorSlider("Highlights", active.highlights, -100f..100f, { replace(active.copy(highlights = it)) })
+                EditorSlider("Shadows", active.shadows, -100f..100f, { replace(active.copy(shadows = it)) })
+                EditorSlider("Tint", active.tint, -100f..100f, { replace(active.copy(tint = it)) }, gradient = TintTrack)
+                EditorSlider("Saturation", active.saturation, -100f..100f, { replace(active.copy(saturation = it)) }, gradient = SaturationTrack)
+            } else Text("This component changes the selection. Edit the first mask in its group to adjust color and light.", color = Muted, fontSize = 10.sp)
+            // Range mask (#7): restrict the mask's coverage to a luminance band.
+            Row(Modifier.horizontalScroll(rememberScrollState()).padding(top = 4.dp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                listOf("None" to "Range: Off", "Luminance" to "Luminance").forEach { (value, label) ->
+                    FilterChip(selected = active.range == value, onClick = { replace(active.copy(range = value)) }, label = { Text(label, fontSize = 9.sp) })
+                }
+            }
+            if (active.range == "Luminance") {
+                EditorSlider("Range from", active.rangeLo, 0f..100f, { replace(active.copy(rangeLo = it.coerceAtMost(active.rangeHi))) })
+                EditorSlider("Range to", active.rangeHi, 0f..100f, { replace(active.copy(rangeHi = it.coerceAtLeast(active.rangeLo))) })
+            }
             if (!aiMask) {
                 EditorSlider("Feather", active.feather * 100f, 2f..100f, { replace(active.copy(feather = it / 100f)) })
                 EditorSlider(when (active.type) { "Linear" -> "Width"; "Brush" -> "Brush size"; else -> "Size" }, active.size * 100f, if (active.type == "Brush") 1f..30f else 5f..100f, { replace(active.copy(size = it / 100f)) })
@@ -1419,6 +1498,7 @@ private fun MaskControls(
                 when {
                     active.type == "Subject" -> "On-device AI selects people. Toggle Invert to adjust the background instead."
                     active.type == "Hair" || active.type == "Skin" || active.type == "Clothes" -> "On-device AI selects people's ${active.type.lowercase()}. Toggle Invert to adjust everything else."
+                    active.type in faceMaskTypes -> if (active.type == "Teeth") "Experimental: selects bright neutral pixels inside the detected mouth. Check the overlay and refine with a brush." else "On-device face contours select the prominent face's ${active.type.lowercase()}. Check the overlay before editing."
                     active.type == "Sky" -> "AI selects the sky on-device. Toggle Invert for the foreground. Rendered on export."
                     active.type == "Brush" -> "Drag on the photo to paint. Stroke points are simplified and rendered through a cached alpha map at export."
                     else -> "The overlay is a fast preview; full-resolution feathering is rendered during export."
@@ -1785,11 +1865,11 @@ private fun GenerativeRemoveModelCard() {
             else -> {
                 Text("Use AI for Generative Remove", color = Ink, fontSize = 12.sp, fontWeight = FontWeight.Medium)
                 Text(
-                    (if (s is Inpainter.Status.Failed) "Download failed: ${s.message}. " else "") +
+                    (if (s is Inpainter.Status.Failed) "AI model error: ${s.message}. " else "") +
                         "Downloads the LaMa model once (${Inpainter.DOWNLOAD_MB} MB, Wi-Fi recommended). It runs fully on this device; until then a simpler fill is used.",
                     color = Muted, fontSize = 10.sp, modifier = Modifier.padding(top = 4.dp),
                 )
-                Text("Download model", color = Accent, fontSize = 12.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 6.dp).clickable { Inpainter.download() }.padding(vertical = 6.dp))
+                Text(if (s is Inpainter.Status.Failed) "Retry AI model" else "Download model", color = Accent, fontSize = 12.sp, fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 6.dp).clickable { Inpainter.retryOrDownload() }.padding(vertical = 6.dp))
             }
         }
     }
@@ -2009,9 +2089,60 @@ private fun Bitmap.scaledToFit(maxSide: Int): Bitmap {
 }
 
 @Composable
-private fun GeometryControls(state: DevelopState, update: (DevelopState) -> Unit) {
+private fun GuidedUprightGuide(guides: List<GuidedUpright.Guide>, frameAspect: Float, onAdd: (GuidedUpright.Guide) -> Unit) {
+    var startPx by remember { mutableStateOf<androidx.compose.ui.geometry.Offset?>(null) }
+    var endPx by remember { mutableStateOf<androidx.compose.ui.geometry.Offset?>(null) }
+    val latestAdd by rememberUpdatedState(onAdd)
+    Canvas(Modifier.fillMaxSize().systemGestureExclusion().pointerInput(Unit) {
+        detectDragGestures(
+            onDragStart = { startPx = it; endPx = it },
+            onDragEnd = {
+                val s = startPx; val e = endPx
+                if (s != null && e != null) {
+                    val rect = fittedImageRect(androidx.compose.ui.geometry.Size(size.width.toFloat(), size.height.toFloat()), frameAspect)
+                    fun nx(v: Float) = ((v - rect.left) / rect.width.coerceAtLeast(1f)).coerceIn(0f, 1f)
+                    fun ny(v: Float) = ((v - rect.top) / rect.height.coerceAtLeast(1f)).coerceIn(0f, 1f)
+                    val g = GuidedUpright.Guide(nx(s.x), ny(s.y), nx(e.x), ny(e.y))
+                    if (g.lengthSq > 0.0025f) latestAdd(g)
+                }
+                startPx = null; endPx = null
+            },
+            onDragCancel = { startPx = null; endPx = null },
+        ) { ev, _ -> ev.consume(); endPx = ev.position }
+    }) {
+        val rect = fittedImageRect(size, frameAspect)
+        guides.forEach { g ->
+            val color = if (g.vertical) Color(0xFF4FC3F7) else Color(0xFFFFB74D) // blue = vertical, amber = horizontal
+            drawLine(
+                color, androidx.compose.ui.geometry.Offset(rect.left + g.x1 * rect.width, rect.top + g.y1 * rect.height),
+                androidx.compose.ui.geometry.Offset(rect.left + g.x2 * rect.width, rect.top + g.y2 * rect.height), 2.5.dp.toPx(),
+            )
+        }
+        val s = startPx; val e = endPx
+        if (s != null && e != null) drawLine(Color.White, s, e, 2.5.dp.toPx())
+    }
+}
+
+@Composable
+private fun GeometryControls(
+    state: DevelopState, update: (DevelopState) -> Unit,
+    guidedMode: Boolean = false, guideCount: Int = 0,
+    onGuided: (Boolean) -> Unit = {}, onApplyGuides: () -> Unit = {}, onClearGuides: () -> Unit = {},
+) {
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
         EditorTitle("GEOMETRY", "Perspective and aspect correction")
+        // Guided Upright (#17): draw reference lines on the photo and solve them into straighten + keystone.
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+            FilterChip(selected = guidedMode, onClick = { onGuided(!guidedMode) }, label = { Text("Guided Upright", fontSize = 11.sp) })
+            if (guidedMode && guideCount > 0) {
+                Text("Apply ($guideCount)", color = Accent, fontSize = 12.sp, fontWeight = FontWeight.Bold, modifier = Modifier.clickable(onClick = onApplyGuides).padding(8.dp))
+                Text("Clear", color = Muted, fontSize = 12.sp, modifier = Modifier.clickable(onClick = onClearGuides).padding(8.dp))
+            }
+        }
+        if (guidedMode) Text(
+            "Draw lines along edges that should be vertical or horizontal (up to 4), then Apply.",
+            color = Muted, fontSize = 10.sp, modifier = Modifier.padding(bottom = 6.dp),
+        )
         Canvas(Modifier.fillMaxWidth().height(82.dp).background(Color(0xFF181A1D), RoundedCornerShape(7.dp)).padding(9.dp)) {
             val vertical = state.geometryVertical / 100f * size.width * .16f
             val horizontal = state.geometryHorizontal / 100f * size.height * .16f

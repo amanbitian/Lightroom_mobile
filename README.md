@@ -54,7 +54,8 @@ The application supports ordinary raster images, TIFF files and many camera-RAW 
 - Safe fallback copies in app storage when a persistent grant is unavailable.
 - All Photos, Recent, Favorites, Rejected and Edited smart views.
 - User-created albums and per-photo album membership.
-- Filename search.
+- Search filenames, captions, keywords, copyright, location and supported camera EXIF fields.
+- Multi-select, batch paste/presets and a persistent background export queue with retry/cancel controls.
 - Sort by import date, name or rating.
 - Three thumbnail-grid densities.
 - Edited thumbnails that show the saved recipe.
@@ -127,9 +128,11 @@ Up to eight masks can be stored in one edit recipe:
 - **Radial:** movable, rotatable elliptical mask with aspect and feather controls.
 - **Person:** on-device full-person segmentation.
 - **Hair, Skin and Clothes:** separate classes from the bundled people model.
+- **Face, Eyes, Eyebrows and Lips:** on-device face contours; the Face mask follows the face oval.
+- **Teeth (experimental):** bright, near-neutral pixels inside the detected inner mouth; inspect the overlay before editing.
 - **Sky:** built-in heuristic sky selection.
 
-Each mask can be enabled, disabled, inverted or deleted, and can adjust Exposure, Contrast, Highlights, Shadows, Temperature, Tint and Saturation. A red overlay can display the affected region.
+Masks support Add, Subtract and Intersect components, plus a luminance range. Group adjustments live on the first mask; the red overlay displays the combined selection. Each mask can be enabled, disabled, inverted or deleted, and the base mask can adjust Exposure, Contrast, Highlights, Shadows, Temperature, Tint and Saturation.
 
 ### Retouch
 
@@ -140,6 +143,8 @@ Up to 24 retouch spots are supported:
 - **Generative Remove:** accepts taps or painted regions of arbitrary shape.
 - **Classic fallback:** built-in smooth fill remains available without downloading a model.
 - **LaMa mode:** optional on-device 512 × 512 inpainting with feathered, color-matched edges.
+
+The optional LaMa model is 182 MB after download and is SHA-256 verified. A memory failure keeps it installed for retry.
 
 ### Lens Blur and background effects
 
@@ -185,6 +190,8 @@ The importer understands common Lightroom preset data including global tone, par
 - Reset adjustments while preserving geometry.
 - Reset the complete recipe.
 - Remove the photo from the local catalog without modifying an external original.
+- Persistent edit history and named versions, including metadata and camera/lens profile choices.
+- Caption, copyright, keywords, capture time, GPS, focal length and aperture editing.
 
 ### Export
 
@@ -201,7 +208,7 @@ Exports are written to `Pictures/LumaRoom`. Android 8 and 9 request legacy write
 
 The Gallery path accepts images exposed by Android's Photo Picker. The Files path advertises standard images, TIFF and common RAW MIME types including DNG, CR2, CR3, NEF, ARW, RW2, RAF, ORF and SRW.
 
-RAW support is preview-oriented: when Android cannot decode a RAW container directly, LumaRoom extracts the largest embedded JPEG preview. It does not currently provide a full proprietary RAW demosaic or camera/lens-profile pipeline.
+Recognized RAW files use the bundled LibRaw engine for sensor unpacking, Bayer/X-Trans demosaicing, camera white balance/matrices and highlight reconstruction. RAW export preserves 16-bit samples through the color pipeline. Imported RGB input ICC profiles use Little CMS. A Lensfun calibration database supports selected rectilinear distortion, TCA and vignetting models. DCP import and some Lensfun models remain unsupported. See [P0 features and limits](docs/P0_FEATURES.md).
 
 ## On-device AI and privacy
 
@@ -224,6 +231,7 @@ RAW support is preview-oriented: when Android cannot decode a RAW container dire
 
 - Android Studio with a JDK 17 runtime.
 - Android SDK 36.
+- Android NDK 28.2.13676358 and CMake 3.22.1 for the bundled RAW engine.
 - An Android 8.0/API 26 or newer device or emulator.
 - Windows, macOS or Linux capable of running the included Gradle wrapper.
 
@@ -282,8 +290,10 @@ Never commit a signing keystore or its passwords.
 
 Current suites contain:
 
-- **33 JVM tests:** color-engine identity and adjustments, curves, preset parsing/blending, removal fill and edit-recipe serialization.
-- **28 connected-device tests:** bitmap rendering, crop/geometry, mask mapping, healing/removal, Lens Blur, segmentation, decoding/orientation, 16-bit writers, export and catalog persistence.
+- **46 JVM tests:** color engine, compound masks and luminance range, curves, preset parsing/blending, removal fill, recipe serialization, metadata validation, batch rules and lens-model math.
+- **44 connected-device tests:** bitmap/editor and RAW workflow checks, plus real portrait facial contours, combined-mask overlay and optional LaMa inference. The LaMa test requires its downloaded model.
+
+See [advanced mask and removal QA](docs/ADVANCED_MASK_REMOVE_QA.md) for current accuracy limits and device test results.
 
 Manual QA assets are available in [`test-assets/photos`](test-assets/photos/README.md). They cover portraits, people masks, sky/landscape editing, low-light noise, architecture/geometry, object removal and HSL/color work.
 
@@ -316,11 +326,14 @@ The dated QC report is available at [`QA_REPORT_2026-10-25.md`](QA_REPORT_2026-1
 - The release configuration is ARM64-only. Debug builds include emulator-compatible native libraries supplied by dependencies.
 - The editor catalog is local; there is no cloud sync, collaboration or desktop/web companion.
 - The app edits photos only; video editing is not supported.
-- RAW handling may use an embedded JPEG preview instead of a true sensor-data demosaic.
+- RAW uses LibRaw's supported-camera database; DCP profiles, scene-linear HDR processing and some lens correction models are not implemented.
 - The optional LaMa model is large and can use substantial memory during inference.
 - Dependency-provided native libraries should be verified on physical 16 KB-page ARM64 devices before production distribution.
 
 ## Additional documentation
+
+- [`docs/P0_FEATURES.md`](docs/P0_FEATURES.md) — new RAW, profiles, batch, versions and metadata workflows, with limits.
+- [`docs/THIRD_PARTY.md`](docs/THIRD_PARTY.md) — pinned native dependencies, Lensfun data attribution and notices.
 
 - [`architecture.md`](architecture.md) — project structure, render pipeline and technical decisions.
 - [`sdd.md`](sdd.md) — data model, algorithms and component contracts.

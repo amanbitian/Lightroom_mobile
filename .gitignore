@@ -12,3 +12,5 @@ app/build/
 *.keystore
 *.apk
 .kotlin/
+.native-sources/
+app/.cxx/

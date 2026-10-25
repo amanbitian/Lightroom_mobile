@@ -101,7 +101,32 @@ class FeatureTest {
         val region = RemovalRegion.of(HealingSpot("g", contentAware = true, brush = true, radius = .12f, strokes = listOf(listOf(MaskPoint(.49f, .49f)))), 512, 512)!!
         assertTrue(Inpainter.inpaint(image, region, 1f))
         val c = image.getPixel(250, 250)
-        assertTrue("filled with sky colour, got ${Integer.toHexString(c)}", (c and 255) > 120)
+        assertTrue("filled with sky colour, got ${Integer.toHexString(c)}", abs((c shr 16 and 255) - 90) < 75 && abs((c shr 8 and 255) - 140) < 75 && abs((c and 255) - 210) < 75)
+        assertEquals("pixels outside the removal region stay untouched", rgb(90, 140, 210), image.getPixel(20, 20))
+    }
+
+    @Test fun faceRegionsFindEyesBrowsLipsAndTeethOnPortrait() {
+        val portrait = InstrumentationRegistry.getInstrumentation().context.assets.open("face-portrait.jpg").use { BitmapFactory.decodeStream(it) }
+        for (type in listOf("Face", "Eyes", "Eyebrows", "Lips", "Teeth")) {
+            val mask = FaceRegionSegmenter.mask(portrait, type)
+            assertNotNull("$type contour unavailable", mask)
+            assertTrue("$type selection empty", mask!!.confidence.count { it > .25f } > if (type == "Teeth") 20 else 100)
+        }
+        portrait.recycle()
+        val blank = solid(600, 600, gray(120))
+        assertTrue("no false face on a uniform image", FaceRegionSegmenter.mask(blank, "Face") == null)
+        blank.recycle()
+    }
+
+    @Test fun compoundMaskOverlayShowsCombinedSelectionAndRange() {
+        val base = LocalMask("base", type = "Radial", size = .45f, feather = .1f, exposure = 1f)
+        val cut = LocalMask("cut", type = "Radial", size = .2f, feather = .1f, combine = "Subtract")
+        val over = ImageExporter.maskOverlay(solid(200, 200, gray(100)), DevelopState(masks = listOf(base, cut)), "cut")
+        assertEquals("subtracted centre must stay clear", gray(100), over.getPixel(100, 100))
+        assertTrue("remaining ring must be visible", (over.getPixel(150, 100) shr 16 and 255) > 100)
+        val range = base.copy(range = "Luminance", rangeLo = 0f, rangeHi = 35f)
+        val light = ImageExporter.maskOverlay(solid(200, 200, gray(210)), DevelopState(masks = listOf(range)), "base")
+        assertEquals("bright tones outside range must stay clear", gray(210), light.getPixel(100, 100))
     }
 
     @Test fun brushAndLinearMasksAdjustOnlyTheirArea() {
@@ -152,7 +177,8 @@ class FeatureTest {
     @Test fun peopleSegmentationRuns() {
         val mask = SubjectSegmenter.mask(solid(300, 200, rgb(90, 140, 70)), SubjectSegmenter.Part.PERSON)
         assertNotNull(mask)
-        assertEquals(256, mask!!.width)
+        assertEquals(384, mask!!.width) // The 256px model is refined against the image on a 384px grid.
+        assertEquals(mask.width * mask.height, mask.confidence.size)
         assertTrue(mask.confidence.average() < .2) // no person in a flat green frame
     }
 

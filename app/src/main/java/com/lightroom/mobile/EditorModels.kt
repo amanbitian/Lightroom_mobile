@@ -96,7 +96,8 @@ data class HealingSpot(
 const val MAX_REMOVE_POINTS = 600
 
 /** Masks computed by on-device AI rather than drawn: they're segmented on whatever frame is being rendered. */
-val aiMaskTypes = setOf("Subject", "Hair", "Skin", "Clothes", "Sky")
+val faceMaskTypes = setOf("Face", "Eyes", "Eyebrows", "Lips", "Teeth")
+val aiMaskTypes = setOf("Subject", "Hair", "Skin", "Clothes", "Sky") + faceMaskTypes
 
 data class LocalMask(
     val id: String,
@@ -110,6 +111,12 @@ data class LocalMask(
     /** Radial only: ratio of the cross axis to the main axis. 1 = circle, <1 wider, >1 taller (before [angle]). */
     val aspect: Float = 1f,
     val invert: Boolean = false,
+    /** Compound masking: "New" starts a mask; "Add"/"Subtract"/"Intersect" combine this one into the mask above it. */
+    val combine: String = "New",
+    /** Range mask: "None", or restrict coverage to a "Luminance" band between [rangeLo]..[rangeHi] (0..100). */
+    val range: String = "None",
+    val rangeLo: Float = 0f,
+    val rangeHi: Float = 100f,
     val exposure: Float = 0f,
     val contrast: Float = 0f,
     val temperature: Float = 0f,
@@ -226,6 +233,8 @@ data class ExportOptions(
     val quality: Int = 94,
     val maxSide: Int = 3200,
     val format: String = "JPEG",
+    val includeMetadata: Boolean = true,
+    val includeLocation: Boolean = false,
 )
 
 data class Preset(
@@ -438,6 +447,7 @@ fun DevelopState.toJson(): JSONObject = JSONObject().apply {
                 put("id", mask.id); put("type", mask.type); put("enabled", mask.enabled)
                 put("centerX", mask.centerX); put("centerY", mask.centerY); put("size", mask.size)
                 put("feather", mask.feather); put("angle", mask.angle); put("aspect", mask.aspect); put("invert", mask.invert)
+                put("combine", mask.combine); put("range", mask.range); put("rangeLo", mask.rangeLo); put("rangeHi", mask.rangeHi)
                 put("exposure", mask.exposure); put("contrast", mask.contrast)
                 put("temperature", mask.temperature); put("saturation", mask.saturation)
                 put("highlights", mask.highlights); put("shadows", mask.shadows); put("tint", mask.tint)
@@ -499,6 +509,10 @@ private fun masksFromJson(json: JSONArray?): List<LocalMask> {
             feather = item.safeFloat("feather", .55f).coerceIn(.02f, 1f),
             angle = item.safeFloat("angle").coerceIn(-180f, 180f),
             aspect = item.safeFloat("aspect", 1f).coerceIn(.2f, 5f),
+            combine = item.optString("combine", "New").takeIf { it in setOf("New", "Add", "Subtract", "Intersect") } ?: "New",
+            range = item.optString("range", "None").takeIf { it in setOf("None", "Luminance") } ?: "None",
+            rangeLo = item.safeFloat("rangeLo", 0f).coerceIn(0f, 100f),
+            rangeHi = item.safeFloat("rangeHi", 100f).coerceIn(0f, 100f),
             invert = item.optBoolean("invert"),
             exposure = item.safeFloat("exposure").coerceIn(-4f, 4f),
             contrast = item.safeFloat("contrast").coerceIn(-100f, 100f),

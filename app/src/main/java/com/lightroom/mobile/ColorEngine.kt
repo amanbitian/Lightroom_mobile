@@ -44,10 +44,27 @@ class ColorEngine(
     private val sampler: MaskSampler? = null,
     private val base: LuminanceBase? = null,
 ) {
-    /** Local masks that actually adjust something, in the order [MaskSampler] indices refer to. */
-    val localMasks: List<LocalMask> = state.masks.filter { mask ->
-        mask.enabled && (mask.exposure != 0f || mask.contrast != 0f || mask.temperature != 0f || mask.saturation != 0f ||
-            mask.highlights != 0f || mask.shadows != 0f || mask.tint != 0f)
+    /** Local masks that actually adjust something, in the order [MaskSampler] indices refer to. A compound group
+     * (a base mask plus its Add/Subtract/Intersect components) is kept whole whenever the base has an adjustment,
+     * since the components carry coverage, not adjustments. */
+    val localMasks: List<LocalMask> = run {
+        fun adjusts(mask: LocalMask) = mask.exposure != 0f || mask.contrast != 0f || mask.temperature != 0f ||
+            mask.saturation != 0f || mask.highlights != 0f || mask.shadows != 0f || mask.tint != 0f
+        buildList {
+            var i = 0
+            while (i < state.masks.size) {
+                var j = i + 1
+                while (j < state.masks.size && state.masks[j].combine != "New") j++
+                val base = state.masks[i]
+                // Preserve group boundaries when a mask is disabled. Otherwise a disabled base can
+                // accidentally turn an Add/Subtract component into a standalone adjustment.
+                if (base.enabled && adjusts(base)) {
+                    add(base)
+                    addAll(state.masks.subList(i + 1, j).filter { it.enabled })
+                }
+                i = j
+            }
+        }
     }
 
     private val monochrome = state.profile == "Monochrome"
@@ -71,6 +88,40 @@ class ColorEngine(
     private val colorActive: Boolean
     private val maskCos = FloatArray(localMasks.size) { cos(Math.toRadians(localMasks[it].angle.toDouble())).toFloat() }
     private val maskSin = FloatArray(localMasks.size) { sin(Math.toRadians(localMasks[it].angle.toDouble())).toFloat() }
+    // Compound masks: each group is a base mask plus the Add/Subtract/Intersect components that follow it.
+    private val maskGroups: List<IntArray> = buildList {
+        var start = 0
+        while (start < localMasks.size) {
+            var end = start + 1
+            while (end < localMasks.size && localMasks[end].combine != "New") end++
+            add((start until end).toList().toIntArray()); start = end
+        }
+    }
+    /** A single mask's coverage (0..1) at a normalized point, including its invert and luminance range. */
+    private fun maskWeight(m: Int, px: Float, py: Float, pLuma: Float): Float {
+        val mask = localMasks[m]
+        var w = when (mask.type) {
+            "Linear" -> {
+                val projected = ((px - mask.centerX) * width * maskCos[m] + (py - mask.centerY) * height * maskSin[m]) / shortSide
+                (projected / (mask.size * mask.feather).coerceAtLeast(.02f) + .5f).coerceIn(0f, 1f)
+            }
+            "Radial" -> {
+                val dx = (px - mask.centerX) * width / shortSide; val dy = (py - mask.centerY) * height / shortSide
+                val rx = dx * maskCos[m] + dy * maskSin[m]
+                val ry = (-dx * maskSin[m] + dy * maskCos[m]) / mask.aspect.coerceIn(.2f, 5f)
+                val distance = sqrt(rx * rx + ry * ry)
+                val outer = mask.size.coerceAtLeast(.05f); val inner = outer * (1f - mask.feather.coerceIn(.02f, 1f))
+                when { distance <= inner -> 1f; distance >= outer -> 0f; else -> 1f - (distance - inner) / (outer - inner).coerceAtLeast(.001f) }
+            }
+            else -> sampler?.weight(m, px, py) ?: 0f
+        }
+        if (mask.invert) w = 1f - w
+        if (mask.range == "Luminance" && w > 0f) {
+            val lo = mask.rangeLo / 100f; val hi = mask.rangeHi / 100f; val f = .08f
+            w *= smoothstep(lo - f, lo + f, pLuma) * (1f - smoothstep(hi - f, hi + f, pLuma))
+        }
+        return w
+    }
     private val bands = FloatArray(2); private val bandIdx = IntArray(2)
     private val shortSide = min(width, height).coerceAtLeast(1).toFloat()
 
@@ -102,7 +153,7 @@ class ColorEngine(
     }
 
     /** Processes [rows] rows of ARGB [pixels] (row-major, this frame's width) starting at frame row [top], in place. */
-    fun process(pixels: IntArray, top: Int, rows: Int, out16: ShortBuffer? = null) {
+    fun process(pixels: IntArray, top: Int, rows: Int, out16: ShortBuffer? = null, input16: ShortBuffer? = null) {
         val lab = FloatArray(3); val rgb = FloatArray(3)
         val vignetteAmount = if (frameEffects) state.vignette / 100f else 0f
         val lensShading = if (frameEffects) state.opticsVignette / 100f else 0f
@@ -123,7 +174,15 @@ class ColorEngine(
                 val color = pixels[index]
                 val px = x.toFloat() / max(1, width - 1)
                 // 1. Linear light: calibration primaries, white balance, exposure.
-                var r = SRGB_TO_LINEAR[(color shr 16) and 255]; var g = SRGB_TO_LINEAR[(color shr 8) and 255]; var b = SRGB_TO_LINEAR[color and 255]
+                fun sourceChannel(channel: Int): Float {
+                    val byte = (color shr (16-channel*8)) and 255
+                    if (input16 == null) return SRGB_TO_LINEAR[byte]
+                    val value = input16.get((y*width+x)*3+channel).toInt() and 65535
+                    // Retouch/geometry may have changed the bitmap; carry its delta onto the precise RAW sample.
+                    val encoded = (value / 65535f + (byte - (value+128)/257) / 255f).coerceIn(0f,1f)
+                    return if (encoded <= .04045f) encoded / 12.92f else ((encoded+.055f)/1.055f).pow(2.4f)
+                }
+                var r = sourceChannel(0); var g = sourceChannel(1); var b = sourceChannel(2)
                 if (calibration != null) {
                     val cr = calibration[0] * r + calibration[1] * g + calibration[2] * b
                     val cg = calibration[3] * r + calibration[4] * g + calibration[5] * b
@@ -166,43 +225,38 @@ class ColorEngine(
                     val greenExcess = (g - (r + b) * .5f - .08f).coerceAtLeast(0f)
                     g += magentaExcess * amount * .9f; r += greenExcess * amount * .45f; b += greenExcess * amount * .45f
                 }
-                // 5. Local masks.
-                for (m in localMasks.indices) {
-                    val mask = localMasks[m]
-                    // Geometric masks measure in real pixels, in units of the frame's short side, so a radial mask
-                    // is round and a gradient's angle is true whatever the aspect (and survives crop/rotate mapping).
-                    var weight = when (mask.type) {
-                        "Linear" -> {
-                            val projected = ((px - mask.centerX) * width * maskCos[m] + (py - mask.centerY) * height * maskSin[m]) / shortSide
-                            (projected / (mask.size * mask.feather).coerceAtLeast(.02f) + .5f).coerceIn(0f, 1f)
+                // 5. Local masks. Masks are grouped: a base mask plus its Add/Subtract/Intersect components,
+                // combined into one coverage before the base's adjustments are applied. Range masks restrict by luminance.
+                if (maskGroups.isNotEmpty()) {
+                    val pLuma0 = .2126f * r + .7152f * g + .0722f * b
+                    for (group in maskGroups) {
+                        var weight = maskWeight(group[0], px, py, pLuma0)
+                        for (gi in 1 until group.size) {
+                            val cw = maskWeight(group[gi], px, py, pLuma0)
+                            weight = when (localMasks[group[gi]].combine) {
+                                "Add" -> maxOf(weight, cw)
+                                "Subtract" -> weight * (1f - cw)
+                                "Intersect" -> weight * cw
+                                else -> weight
+                            }
                         }
-                        "Radial" -> {
-                            val dx = (px - mask.centerX) * width / shortSide; val dy = (py - mask.centerY) * height / shortSide
-                            // Rotate into the ellipse's own frame, then stretch the cross axis so the test is round again.
-                            val rx = dx * maskCos[m] + dy * maskSin[m]
-                            val ry = (-dx * maskSin[m] + dy * maskCos[m]) / mask.aspect.coerceIn(.2f, 5f)
-                            val distance = sqrt(rx * rx + ry * ry)
-                            val outer = mask.size.coerceAtLeast(.05f); val inner = outer * (1f - mask.feather.coerceIn(.02f, 1f))
-                            when { distance <= inner -> 1f; distance >= outer -> 0f; else -> 1f - (distance - inner) / (outer - inner).coerceAtLeast(.001f) }
+                        if (weight <= .001f) continue
+                        val mask = localMasks[group[0]]
+                        val exposure = 2.0.pow((mask.exposure * weight).toDouble()).toFloat()
+                        val contrast = 1f + mask.contrast / 100f * weight
+                        r = (r * exposure - .5f) * contrast + .5f; g = (g * exposure - .5f) * contrast + .5f; b = (b * exposure - .5f) * contrast + .5f
+                        r += (mask.temperature * .12f + mask.tint * .04f) / 100f * weight
+                        g -= mask.tint / 100f * .08f * weight
+                        b -= (mask.temperature * .12f - mask.tint * .04f) / 100f * weight
+                        var localLuma = .2126f * r + .7152f * g + .0722f * b
+                        if (mask.highlights != 0f || mask.shadows != 0f) {
+                            val lift = (mask.highlights / 100f * .3f * smoothstep(.4f, 1f, localLuma) +
+                                mask.shadows / 100f * .3f * (1f - smoothstep(0f, .6f, localLuma))) * weight
+                            r += lift; g += lift; b += lift; localLuma += lift
                         }
-                        else -> sampler?.weight(m, px, py) ?: 0f
+                        val sat = 1f + mask.saturation / 100f * weight
+                        r = localLuma + (r - localLuma) * sat; g = localLuma + (g - localLuma) * sat; b = localLuma + (b - localLuma) * sat
                     }
-                    if (mask.invert) weight = 1f - weight
-                    if (weight <= .001f) continue
-                    val exposure = 2.0.pow((mask.exposure * weight).toDouble()).toFloat()
-                    val contrast = 1f + mask.contrast / 100f * weight
-                    r = (r * exposure - .5f) * contrast + .5f; g = (g * exposure - .5f) * contrast + .5f; b = (b * exposure - .5f) * contrast + .5f
-                    r += (mask.temperature * .12f + mask.tint * .04f) / 100f * weight
-                    g -= mask.tint / 100f * .08f * weight
-                    b -= (mask.temperature * .12f - mask.tint * .04f) / 100f * weight
-                    var localLuma = .2126f * r + .7152f * g + .0722f * b
-                    if (mask.highlights != 0f || mask.shadows != 0f) {
-                        val lift = (mask.highlights / 100f * .3f * smoothstep(.4f, 1f, localLuma) +
-                            mask.shadows / 100f * .3f * (1f - smoothstep(0f, .6f, localLuma))) * weight
-                        r += lift; g += lift; b += lift; localLuma += lift
-                    }
-                    val sat = 1f + mask.saturation / 100f * weight
-                    r = localLuma + (r - localLuma) * sat; g = localLuma + (g - localLuma) * sat; b = localLuma + (b - localLuma) * sat
                 }
                 // 6. Dehaze: contrast and colour depth, lifting the haze floor.
                 if (dehaze != 0f) {

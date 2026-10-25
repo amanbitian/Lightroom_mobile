@@ -26,7 +26,18 @@ import kotlin.math.max
 object RawDecoder {
     val rawExtensions = setOf("dng", "cr2", "cr3", "nef", "arw", "raf", "rw2", "orf", "srw", "pef", "dcr", "kdc", "3fr")
 
-    fun decode(context: Context, uri: Uri, maxSide: Int): Bitmap? {
+    fun decode(context: Context, uri: Uri, maxSide: Int, metadataOverride: PhotoMetadata? = null): Bitmap? {
+        val metadata = metadataOverride ?: LibraryStore(context).let { store -> try { store.loadMetadata(uri.toString()) } finally { store.close() } }
+        val bitmap = decodeInput(context, uri, maxSide, metadata?.cameraProfile.orEmpty()) ?: return null
+        if (metadata == null || metadata.lensProfile.isBlank()) return bitmap
+        return try {
+            val profile = LensProfiles.load(context).firstOrNull { it.id == metadata.lensProfile } ?: error("Lens profile unavailable")
+            LensProfiles.correct(bitmap, profile, metadata)
+        } catch (_: Exception) { bitmap.recycle(); null }
+    }
+
+    private fun decodeInput(context: Context, uri: Uri, maxSide: Int, cameraProfile: String): Bitmap? {
+        if (NativeRaw.isRaw(context, uri)) return runCatching { NativeRaw.decode(context, uri, maxSide, cameraProfile) }.getOrNull()
         decodeStandard(context, uri, maxSide)?.let { return it }
         // ImageDecoder already applies EXIF orientation itself.
         decodeWithImageDecoder(context, uri, maxSide)?.let { return fitWithin(it, maxSide) }

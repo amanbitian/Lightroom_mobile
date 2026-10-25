@@ -14,13 +14,15 @@ import java.util.zip.Deflater
 object TiffPngWriter {
 
     /** Baseline uncompressed little-endian RGB 16-bit TIFF. */
-    fun writeTiff16(pixels: ShortBuffer, width: Int, height: Int, out: OutputStream) {
-        val entryCount = 11
+    fun writeTiff16(pixels: ShortBuffer, width: Int, height: Int, out: OutputStream, xmp: String? = null) {
+        val metadata = xmp?.toByteArray(Charsets.UTF_8) ?: ByteArray(0)
+        val entryCount = if (xmp == null) 11 else 12
         val ifdOffset = 8
         val ifdSize = 2 + entryCount * 12 + 4
         val bitsPerSampleOffset = ifdOffset + ifdSize
         val sampleFormatOffset = bitsPerSampleOffset + 6
-        val pixelOffset = sampleFormatOffset + 6
+        val metadataOffset = sampleFormatOffset + 6
+        val pixelOffset = metadataOffset + metadata.size + metadata.size % 2
         val pixelBytes = width.toLong() * height.toLong() * 6L
 
         val header = ByteArray(pixelOffset)
@@ -49,9 +51,11 @@ object TiffPngWriter {
         entry(279, 4, 1, pixelBytes)                     // StripByteCounts
         entry(284, 3, 1, 1)                              // PlanarConfig = chunky
         entry(339, 3, 3, sampleFormatOffset.toLong())    // SampleFormat -> 1,1,1 (uint)
+        if (xmp != null) entry(700, 1, metadata.size.toLong(), metadataOffset.toLong())
         putLong(e, 0)                                    // next IFD = 0
         putShort(bitsPerSampleOffset, 16); putShort(bitsPerSampleOffset + 2, 16); putShort(bitsPerSampleOffset + 4, 16)
         putShort(sampleFormatOffset, 1); putShort(sampleFormatOffset + 2, 1); putShort(sampleFormatOffset + 4, 1)
+        metadata.copyInto(header, metadataOffset)
         out.write(header)
 
         // Pixel data, little-endian 16-bit samples, in strips/rows.
@@ -72,7 +76,7 @@ object TiffPngWriter {
     }
 
     /** 16-bit RGB PNG (bit depth 16, color type 2), filter None, zlib-deflated. */
-    fun writePng16(pixels: ShortBuffer, width: Int, height: Int, out: OutputStream) {
+    fun writePng16(pixels: ShortBuffer, width: Int, height: Int, out: OutputStream, xmp: String? = null) {
         out.write(byteArrayOf(0x89.toByte(), 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A))
         val ihdr = ByteArray(13)
         fun putInt(a: ByteArray, o: Int, v: Int) {
@@ -82,6 +86,7 @@ object TiffPngWriter {
         putInt(ihdr, 0, width); putInt(ihdr, 4, height)
         ihdr[8] = 16; ihdr[9] = 2; ihdr[10] = 0; ihdr[11] = 0; ihdr[12] = 0
         writeChunk(out, "IHDR", ihdr)
+        if (xmp != null) PhotoMetadataIO.pngXmp(out, xmp)
 
         // Stream scanlines (1 filter byte + big-endian 16-bit RGB) through the deflater one row at a time and emit
         // IDAT chunks as compressed data accumulates: memory stays O(row) instead of the whole image (144 MB at 24 MP).

@@ -10,6 +10,8 @@ plugins {
 android {
     namespace = "com.lightroom.mobile"
     compileSdk = 36
+    ndkVersion = "28.2.13676358"
+    externalNativeBuild { cmake { path = file("src/main/cpp/CMakeLists.txt"); version = "3.22.1" } }
 
     defaultConfig {
         applicationId = "com.lightroom.mobile"
@@ -18,6 +20,7 @@ android {
         versionCode = 20
         versionName = "0.20.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+        externalNativeBuild { cmake { arguments += "-DANDROID_SUPPORT_FLEXIBLE_PAGE_SIZES=ON" } }
     }
 
     // Release signing secrets come from local.properties (git-ignored) or environment variables, never from git:
@@ -37,6 +40,7 @@ android {
     }
 
     buildTypes {
+        debug { ndk { abiFilters += listOf("arm64-v8a", "x86_64") } }
         release {
             // R8 strips unused code (the debug APK carries ~28 MB of dex) and resources.
             isMinifyEnabled = true
@@ -70,6 +74,7 @@ kotlin {
     }
 }
 
+
 dependencies {
     implementation(platform("androidx.compose:compose-bom:2024.09.03"))
     implementation("androidx.activity:activity-compose:1.9.2")
@@ -84,6 +89,8 @@ dependencies {
     // LiteRT (formerly TensorFlow Lite) runs the on-device AI models: people segmentation (bundled in
     // assets/models) and LaMa inpainting for Generative Remove (downloaded on first use).
     implementation("com.google.ai.edge.litert:litert:1.0.1")
+    // Bundled on-device facial contours for eyes, eyebrows, lips and face-region masks.
+    implementation("com.google.mlkit:face-detection:16.1.7")
     debugImplementation("androidx.compose.ui:ui-tooling")
     testImplementation("junit:junit:4.13.2")
     // Real org.json so JVM unit tests can exercise recipe serialization (the Android stub throws when un-mocked).

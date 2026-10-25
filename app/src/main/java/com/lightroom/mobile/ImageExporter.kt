@@ -36,17 +36,31 @@ object ImageExporter {
         data class Failed(val reason: String) : ExportResult
     }
 
-    suspend fun export(context: Context, photo: PhotoItem, state: DevelopState, options: ExportOptions = ExportOptions()): ExportResult = withContext(Dispatchers.IO) {
+    suspend fun export(context: Context, photo: PhotoItem, state: DevelopState, options: ExportOptions = ExportOptions(), metadata: PhotoMetadata? = null): ExportResult = withContext(Dispatchers.IO) {
         try {
+            val meta = if (options.includeMetadata) metadata ?: LibraryStore(context).let { store -> try { store.loadMetadata(photo.uri) ?: PhotoMetadataIO.read(context, Uri.parse(photo.uri)) } finally { store.close() } } else null
+            val xmp = meta?.let { PhotoMetadataIO.xmp(it, options.includeLocation) }
             // Each stage consumes (recycles) its input, so roughly one full-size copy is alive at a time.
-            val source = decodeScaled(context, Uri.parse(photo.uri), options.maxSide.coerceIn(512, 6000))
+            val uri = Uri.parse(photo.uri)
+            val settings = metadata ?: LibraryStore(context).let { store -> try { store.loadMetadata(photo.uri) } finally { store.close() } }
+            val precise = if (NativeRaw.isRaw(context, uri)) NativeRaw.decodeFrame(context, uri, options.maxSide.coerceIn(512,6000), settings?.cameraProfile.orEmpty())?.let { raw ->
+                if (settings == null || settings.lensProfile.isBlank()) raw else {
+                    val lens = LensProfiles.load(context).firstOrNull { it.id == settings.lensProfile } ?: error("Lens profile unavailable")
+                    LensProfiles.correctFrame(raw.bitmap,lens,settings,raw.rgb16)
+                }
+            } else null
+            val source = precise?.bitmap ?: RawDecoder.decode(context, uri, options.maxSide.coerceIn(512, 6000), settings)
                 ?: return@withContext ExportResult.Failed("Couldn't read the original photo")
             // AI masks and the background effect are segmented on the original (as in the editor's preview), then looked
             // up through the inverse frame mapping, so crop/rotation never change what they select.
             val aiTypes = state.masks.filter { it.enabled && it.type in aiMaskTypes }.map { it.type }.toSet() +
                 (if (state.background != "None") setOf("Subject") else emptySet())
             val sourceMasks = aiTypes.associateWith { segment(it, source) }
+            val sourceWidth = source.width; val sourceHeight = source.height
             val (framed, frame) = transform(source, state)
+            val preciseInput = precise?.rgb16?.order(java.nio.ByteOrder.nativeOrder())?.asShortBuffer()?.let { input ->
+                remapPrecision(input, sourceWidth, sourceHeight, framed.width, framed.height, frame)
+            }
             // Masks, heal spots and the blur focus are positioned on the original photo; move them into the output frame.
             val local = frame.remap(state)
             val grid = if (sourceMasks.isEmpty()) null else frame.sourceGrid()
@@ -61,25 +75,30 @@ object ImageExporter {
                 val out16 = java.nio.ByteBuffer.allocateDirect(w * h * 3 * 2).order(java.nio.ByteOrder.nativeOrder()).asShortBuffer()
                 // The colour engine writes the 16-bit tonal result; detail, background and lens blur are 8-bit passes,
                 // so their per-pixel change is added on top (pixels they don't touch keep full 16-bit precision).
-                val finalBitmap = applyLensBlur(applyBackground(adjustPixels(healed, local, out16, sourceMasks = ai), local, sourceMasks = ai), local)
+                val finalBitmap = applyLensBlur(applyBackground(adjustPixels(healed, local, out16, sourceMasks = ai, input16 = preciseInput), local, sourceMasks = ai), local)
                 addEightBitEffects(out16, finalBitmap)
                 finalBitmap.recycle()
                 val extension = if (isTiff) "tif" else "png"
                 val mime = if (isTiff) "image/tiff" else "image/png"
                 writeImage(context, "${baseName}_16_${System.currentTimeMillis()}.$extension", mime) { os ->
-                    if (isTiff) TiffPngWriter.writeTiff16(out16, w, h, os) else TiffPngWriter.writePng16(out16, w, h, os)
+                    if (isTiff) TiffPngWriter.writeTiff16(out16, w, h, os, xmp) else TiffPngWriter.writePng16(out16, w, h, os, xmp)
                 }
             } else {
                 val isPng = options.format.equals("PNG", ignoreCase = true)
                 val compressFormat = if (isPng) Bitmap.CompressFormat.PNG else Bitmap.CompressFormat.JPEG
                 val quality = options.quality.coerceIn(50, 100)
-                val finalBitmap = applyLensBlur(applyBackground(adjustPixels(healed, local, sourceMasks = ai), local, sourceMasks = ai), local)
+                val finalBitmap = applyLensBlur(applyBackground(adjustPixels(healed, local, sourceMasks = ai, input16 = preciseInput), local, sourceMasks = ai), local)
                 val extension = if (isPng) "png" else "jpg"
                 val mime = if (isPng) "image/png" else "image/jpeg"
                 try {
-                    writeImage(context, "${baseName}_${System.currentTimeMillis()}.$extension", mime) { os ->
-                        check(finalBitmap.compress(compressFormat, quality, os)) { "Encoding failed" }
-                    }
+                    val temporary = File.createTempFile("export-", ".$extension", context.cacheDir)
+                    try {
+                        temporary.outputStream().use { check(finalBitmap.compress(compressFormat, quality, it)) { "Encoding failed" } }
+                        if (!isPng && meta != null) PhotoMetadataIO.writeJpeg(temporary, meta, options.includeLocation)
+                        writeImage(context, "${baseName}_${java.util.UUID.randomUUID()}.$extension", mime) { os ->
+                            if (isPng && xmp != null) PhotoMetadataIO.copyPngWithMetadata(temporary, os, xmp) else temporary.inputStream().use { it.copyTo(os) }
+                        }
+                    } finally { temporary.delete() }
                 } finally { finalBitmap.recycle() }
             }
         } catch (cancelled: kotlinx.coroutines.CancellationException) {
@@ -96,7 +115,24 @@ object ImageExporter {
         fun alpha(type: String, px: Float, py: Float) = grid.alpha(masks[type], px, py)
     }
 
+    private fun remapPrecision(input: java.nio.ShortBuffer, sw: Int, sh: Int, w: Int, h: Int, frame: FrameMap): java.nio.ShortBuffer {
+        if(frame.isIdentity && sw==w && sh==h) return input
+        val output = java.nio.ByteBuffer.allocateDirect(w*h*6).order(java.nio.ByteOrder.nativeOrder()).asShortBuffer()
+        for (y in 0 until h) for (x in 0 until w) {
+            val (nx,ny)=frame.source((x+.5f)/w,(y+.5f)/h)
+            val sx=(nx*sw-.5f).coerceIn(0f,sw-1f); val sy=(ny*sh-.5f).coerceIn(0f,sh-1f)
+            val ix=sx.toInt(); val iy=sy.toInt(); val fx=sx-ix; val fy=sy-iy
+            for (c in 0..2) {
+                fun at(xx: Int, yy: Int)=(input.get((yy*sw+xx)*3+c).toInt() and 65535).toFloat()
+                val value=(at(ix,iy)*(1-fx)+at(min(ix+1,sw-1),iy)*fx)*(1-fy)+(at(ix,min(iy+1,sh-1))*(1-fx)+at(min(ix+1,sw-1),min(iy+1,sh-1))*fx)*fy
+                output.put((y*w+x)*3+c,(value+.5f).toInt().coerceIn(0,65535).toShort())
+            }
+        }
+        return output
+    }
+
     private fun segment(type: String, bitmap: Bitmap): SubjectSegmenter.Mask? = when (type) {
+        in faceMaskTypes -> FaceRegionSegmenter.mask(bitmap, type)
         "Sky" -> SkySegmenter.skyMask(bitmap)
         "Hair" -> SubjectSegmenter.mask(bitmap, SubjectSegmenter.Part.HAIR)
         "Skin" -> SubjectSegmenter.mask(bitmap, SubjectSegmenter.Part.SKIN)
@@ -147,6 +183,7 @@ object ImageExporter {
 
         private val scale = before.mapRadius(1f) * after.mapRadius(1f)
         private val identity = before.isIdentity && after.isIdentity && distortion == null && srcW == outW && srcH == outH
+        val isIdentity: Boolean get() = identity
 
         fun point(x: Float, y: Float): Pair<Float, Float> {
             val p = floatArrayOf(x * srcW, y * srcH)
@@ -642,13 +679,52 @@ object ImageExporter {
      * exactly what a mask/filter affects — like Lightroom's mask overlay. Handles geometric, brush and AI masks.
      */
     internal fun maskOverlay(frame: Bitmap, state: DevelopState, maskId: String, segmentationKey: Any? = null): Bitmap {
-        val mask = state.masks.firstOrNull { it.id == maskId && it.enabled } ?: return frame
+        val selected = state.masks.indexOfFirst { it.id == maskId && it.enabled }
+        if (selected < 0) return frame
+        val start = (selected downTo 0).firstOrNull { it == 0 || state.masks[it].combine == "New" } ?: 0
+        if (!state.masks[start].enabled) return frame
+        val end = (start + 1 until state.masks.size).firstOrNull { state.masks[it].combine == "New" } ?: state.masks.size
+        val group = state.masks.subList(start, end).filter { it.enabled }
+        val components = group.drop(1)
         val w = frame.width; val h = frame.height
         val shortSide = minOf(w, h).toFloat()
-        val cosA = cos(Math.toRadians(mask.angle.toDouble())).toFloat(); val sinA = sin(Math.toRadians(mask.angle.toDouble())).toFloat()
-        val brush = if (mask.type == "Brush") renderBrushMask(mask, w, h) else null
-        val ai = if (mask.type in aiMaskTypes) cachedSegmentation(segmentationKey, mask.type) { segment(mask.type, frame) }
-            ?.let { SubjectSegmenter.Mask(it.width, it.height, featherMask(it.confidence, it.width, it.height, (minOf(it.width, it.height) * 0.012f).toInt().coerceIn(1, 24))) } else null
+        val brushes = group.filter { it.type == "Brush" }.associate { it.id to renderBrushMask(it, w, h) }
+        val ai = group.filter { it.type in aiMaskTypes }.map { it.type }.distinct().associateWith { type ->
+            cachedSegmentation(segmentationKey, type) { segment(type, frame) }
+        }
+        val angles = group.associate { it.id to (cos(Math.toRadians(it.angle.toDouble())).toFloat() to sin(Math.toRadians(it.angle.toDouble())).toFloat()) }
+        fun smooth(a: Float, b: Float, value: Float): Float {
+            val t = ((value - a) / (b - a).coerceAtLeast(.0001f)).coerceIn(0f, 1f)
+            return t * t * (3f - 2f * t)
+        }
+        fun coverage(mask: LocalMask, px: Float, py: Float, luma: Float): Float {
+            val (cosA, sinA) = angles.getValue(mask.id)
+            var weight = when (mask.type) {
+                "Linear" -> {
+                    val projected = ((px - mask.centerX) * w * cosA + (py - mask.centerY) * h * sinA) / shortSide
+                    (projected / (mask.size * mask.feather).coerceAtLeast(.02f) + .5f).coerceIn(0f, 1f)
+                }
+                "Radial" -> {
+                    val dx = (px - mask.centerX) * w / shortSide; val dy = (py - mask.centerY) * h / shortSide
+                    val rx = dx * cosA + dy * sinA; val ry = (-dx * sinA + dy * cosA) / mask.aspect.coerceIn(.2f, 5f)
+                    val distance = sqrt(rx * rx + ry * ry)
+                    val outer = mask.size.coerceAtLeast(.05f); val inner = outer * (1f - mask.feather.coerceIn(.02f, 1f))
+                    when { distance <= inner -> 1f; distance >= outer -> 0f; else -> 1f - (distance - inner) / (outer - inner).coerceAtLeast(.001f) }
+                }
+                "Brush" -> brushes[mask.id]?.let { brush ->
+                    val bx = (px * (brush.width - 1)).toInt().coerceIn(0, brush.width - 1)
+                    val by = (py * (brush.height - 1)).toInt().coerceIn(0, brush.height - 1)
+                    ((brush.alpha[by * brush.width + bx] ushr 24) and 255) / 255f * mask.flow
+                } ?: 0f
+                else -> sampleMaskAlpha(ai[mask.type], px, py)
+            }
+            if (mask.invert) weight = 1f - weight
+            if (mask.range == "Luminance" && weight > 0f) {
+                weight *= smooth(mask.rangeLo / 100f - .08f, mask.rangeLo / 100f + .08f, luma) *
+                    (1f - smooth(mask.rangeHi / 100f - .08f, mask.rangeHi / 100f + .08f, luma))
+            }
+            return weight
+        }
         val target = mutable(frame)
         val row = IntArray(w)
         for (y in 0 until h) {
@@ -656,28 +732,20 @@ object ImageExporter {
             val py = y.toFloat() / max(1, h - 1)
             for (x in 0 until w) {
                 val px = x.toFloat() / max(1, w - 1)
-                var weight = when (mask.type) {
-                    "Linear" -> {
-                        val projected = ((px - mask.centerX) * w * cosA + (py - mask.centerY) * h * sinA) / shortSide
-                        (projected / (mask.size * mask.feather).coerceAtLeast(.02f) + .5f).coerceIn(0f, 1f)
+                val o = row[x]
+                val luma = ((o shr 16 and 255) * .2126f + (o shr 8 and 255) * .7152f + (o and 255) * .0722f) / 255f
+                var weight = coverage(group[0], px, py, luma)
+                for (component in components) {
+                    val c = coverage(component, px, py, luma)
+                    weight = when (component.combine) {
+                        "Add" -> maxOf(weight, c)
+                        "Subtract" -> weight * (1f - c)
+                        "Intersect" -> weight * c
+                        else -> weight
                     }
-                    "Radial" -> {
-                        val dx = (px - mask.centerX) * w / shortSide; val dy = (py - mask.centerY) * h / shortSide
-                        val rx = dx * cosA + dy * sinA; val ry = (-dx * sinA + dy * cosA) / mask.aspect.coerceIn(.2f, 5f)
-                        val distance = sqrt(rx * rx + ry * ry)
-                        val outer = mask.size.coerceAtLeast(.05f); val inner = outer * (1f - mask.feather.coerceIn(.02f, 1f))
-                        when { distance <= inner -> 1f; distance >= outer -> 0f; else -> 1f - (distance - inner) / (outer - inner).coerceAtLeast(.001f) }
-                    }
-                    "Brush" -> brush?.let { b ->
-                        val bx = (px * (b.width - 1)).toInt().coerceIn(0, b.width - 1); val by = (py * (b.height - 1)).toInt().coerceIn(0, b.height - 1)
-                        ((b.alpha[by * b.width + bx] ushr 24) and 255) / 255f
-                    } ?: 0f
-                    else -> sampleMaskAlpha(ai, px, py)
                 }
-                if (mask.invert) weight = 1f - weight
                 if (weight <= .01f) continue
                 val a = (weight * .5f).coerceIn(0f, .5f)
-                val o = row[x]
                 val nr = ((o shr 16 and 255) + (230 - (o shr 16 and 255)) * a).toInt().coerceIn(0, 255)
                 val ng = ((o shr 8 and 255) + (45 - (o shr 8 and 255)) * a).toInt().coerceIn(0, 255)
                 val nb = ((o and 255) + (70 - (o and 255)) * a).toInt().coerceIn(0, 255)
@@ -708,6 +776,7 @@ object ImageExporter {
         source: Bitmap, state: DevelopState, out16: java.nio.ShortBuffer? = null,
         frameEffects: Boolean = true, segmentationKey: Any? = null, checkCancelled: (() -> Unit)? = null,
         detail: Boolean = true, sourceMasks: SourceMasks? = null,
+        input16: java.nio.ShortBuffer? = null,
     ): Bitmap {
         val bitmap = if (source.isMutable) source else source.copy(Bitmap.Config.ARGB_8888, true).also { source.recycle() }
         val width = bitmap.width
@@ -740,7 +809,7 @@ object ImageExporter {
             checkCancelled?.invoke()
             val rows = min(tileHeight, height - top)
             bitmap.getPixels(pixels, 0, width, 0, top, width, rows)
-            engine.process(pixels, top, rows, out16)
+            engine.process(pixels, top, rows, out16, input16)
             bitmap.setPixels(pixels, 0, width, 0, top, width, rows)
         }
         // Sharpening amount is modulated by Detail (fine vs. coarse) and Radius (halo width),
