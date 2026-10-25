@@ -63,6 +63,9 @@ class LibraryStore(
         }, SQLiteDatabase.CONFLICT_REPLACE)
     }
 
+    /** Drops a photo's saved edit (used when the recipe is reverted to the original). */
+    fun deleteEdit(uri: String) { database.writableDatabase.delete("edits", "uri = ?", arrayOf(uri)) }
+
     /** Every photo with a saved edit, read once so the grid doesn't query per thumbnail. */
     fun editedUris(): Set<String> = database.readableDatabase.rawQuery("SELECT uri FROM edits", null).use { cursor ->
         buildSet { while (cursor.moveToNext()) add(cursor.getString(0)) }

@@ -9,12 +9,12 @@ plugins {
 
 android {
     namespace = "com.lightroom.mobile"
-    compileSdk = 35
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "com.lightroom.mobile"
         minSdk = 26
-        targetSdk = 35
+        targetSdk = 36
         versionCode = 20
         versionName = "0.20.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
@@ -79,11 +79,15 @@ dependencies {
     implementation("androidx.compose.foundation:foundation")
     implementation("androidx.compose.material3:material3")
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.6")
+    // AndroidX ExifInterface: the platform android.media.ExifInterface has had malformed-EXIF CVEs.
+    implementation("androidx.exifinterface:exifinterface:1.3.7")
     // LiteRT (formerly TensorFlow Lite) runs the on-device AI models: people segmentation (bundled in
     // assets/models) and LaMa inpainting for Generative Remove (downloaded on first use).
     implementation("com.google.ai.edge.litert:litert:1.0.1")
     debugImplementation("androidx.compose.ui:ui-tooling")
     testImplementation("junit:junit:4.13.2")
+    // Real org.json so JVM unit tests can exercise recipe serialization (the Android stub throws when un-mocked).
+    testImplementation("org.json:json:20231013")
     // On-device feature tests (Bitmap pipeline, decoders, catalog): ./gradlew connectedDebugAndroidTest
     androidTestImplementation("androidx.test:runner:1.6.2")
     androidTestImplementation("androidx.test.ext:junit:1.2.1")

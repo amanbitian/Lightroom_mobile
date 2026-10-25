@@ -124,6 +124,9 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.clipRect
 import androidx.compose.ui.graphics.drawscope.clipPath
+import androidx.compose.ui.graphics.drawscope.rotate
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
@@ -232,9 +235,18 @@ private fun LumaRoomApp() {
                     PhotoItem(kept.toString(), name)
                 }
             }
-            added.filter { item -> photos.none { it.uri == item.uri } }.forEach { photos.add(0, it) }
+            val newly = added.filter { item -> photos.none { it.uri == item.uri } }
+            newly.forEach { photos.add(0, it) }
             withContext(Dispatchers.IO) { store.savePhotos(photos.toList()) }
-            if (added.isNotEmpty()) Toast.makeText(context, if (added.size == 1) "1 photo imported" else "${added.size} photos imported", Toast.LENGTH_SHORT).show()
+            val skipped = added.size - newly.size
+            val message = when {
+                newly.isEmpty() && skipped > 0 -> if (skipped == 1) "Already imported" else "$skipped already imported"
+                newly.isEmpty() -> return@launch
+                skipped > 0 -> "${newly.size} imported · $skipped already added"
+                newly.size == 1 -> "1 photo imported"
+                else -> "${newly.size} photos imported"
+            }
+            Toast.makeText(context, message, Toast.LENGTH_SHORT).show()
         }
     }
     // Gallery: Android's photo picker shows every photo and album on the device (no storage permission needed).
@@ -314,6 +326,11 @@ private fun LumaRoomApp() {
                         val uri = selectedPhoto!!.uri
                         persist { store.removePhoto(uri) } // queued after any pending writes, so they can't re-add it
                         editedUris = editedUris - uri
+                        // Drop it from any albums too, so it doesn't linger as a dead entry in album filters.
+                        if (albums.values.any { uri in it }) {
+                            val updated = albums.mapValues { (_, members) -> members - uri }
+                            albums = updated; persist { store.saveAlbums(updated) }
+                        }
                         // Copies made at import (see copyIntoApp) belong to the app; originals elsewhere are never touched.
                         Uri.parse(uri).takeIf { it.scheme == "file" }?.path?.let { path ->
                             if (path.startsWith(java.io.File(context.filesDir, "imports").path)) java.io.File(path).delete()
@@ -323,8 +340,15 @@ private fun LumaRoomApp() {
                     },
                     onSave = { state ->
                         selectedPhoto?.uri?.let { uri ->
-                            persist { store.saveEdit(uri, state) }
-                            if (uri !in editedUris) editedUris = editedUris + uri
+                            // Reverted to the original (ignoring preset bookkeeping): drop the edit so the
+                            // Edited badge and cached edited thumbnail clear instead of lingering.
+                            if (state.copy(presetId = null, presetBase = null, presetFields = null) == DevelopState()) {
+                                persist { store.deleteEdit(uri) }
+                                editedUris = editedUris - uri
+                            } else {
+                                persist { store.saveEdit(uri, state) }
+                                if (uri !in editedUris) editedUris = editedUris + uri
+                            }
                             editStamps = editStamps + (uri to System.nanoTime())
                         }
                     },
@@ -369,8 +393,8 @@ private fun friendlyName(context: android.content.Context, uri: Uri, reported: S
     val extension = reported.substringAfterLast('.', "jpg")
     val taken = runCatching {
         context.contentResolver.openInputStream(uri)?.use { stream ->
-            val exif = android.media.ExifInterface(stream)
-            exif.getAttribute(android.media.ExifInterface.TAG_DATETIME_ORIGINAL) ?: exif.getAttribute(android.media.ExifInterface.TAG_DATETIME)
+            val exif = androidx.exifinterface.media.ExifInterface(stream)
+            exif.getAttribute(androidx.exifinterface.media.ExifInterface.TAG_DATETIME_ORIGINAL) ?: exif.getAttribute(androidx.exifinterface.media.ExifInterface.TAG_DATETIME)
         }
     }.getOrNull()
     val stamp = taken?.let { Regex("""(\d{4}):(\d{2}):(\d{2}) (\d{2}):(\d{2}):(\d{2})""").find(it)?.destructured }
@@ -621,7 +645,7 @@ private fun SettingsScreen(photoCount: Int, modifier: Modifier = Modifier) {
         SettingsRow(
             "On-device AI",
             "People masks (bundled) · Generative Remove: " + when (val st = lama) {
-                Inpainter.Status.Ready -> "LaMa installed (174 MB)"
+                Inpainter.Status.Ready -> "LaMa installed (${Inpainter.DOWNLOAD_MB} MB)"
                 is Inpainter.Status.Downloading -> "downloading ${(st.progress * 100).toInt()}%"
                 else -> "not downloaded (download from Retouch)"
             },
@@ -658,9 +682,12 @@ private fun EditorScreen(
     val context = LocalContext.current
     val configuration = LocalConfiguration.current
     val scope = rememberCoroutineScope()
-    val editorBitmap by produceState<Bitmap?>(null, photo.uri) {
-        value = BitmapRepository.load(context, Uri.parse(photo.uri), 1600)
+    // null while loading; a Result so a decode failure (missing/unsupported/revoked URI) is distinct from loading.
+    val loadResult by produceState<Result<Bitmap>?>(null, photo.uri) {
+        value = runCatching { BitmapRepository.load(context, Uri.parse(photo.uri), 1600) ?: error("This photo couldn't be opened") }
     }
+    val editorBitmap = loadResult?.getOrNull()
+    val loadFailed = loadResult?.isFailure == true
     val imageAspect = editorBitmap?.let { it.width.toFloat() / it.height.coerceAtLeast(1) } ?: 1f
     var panel by remember { mutableStateOf(ToolPanel.LIGHT) }
     var showHistogram by remember { mutableStateOf(false) }
@@ -672,6 +699,10 @@ private fun EditorScreen(
     var showExport by remember { mutableStateOf(false) }
     var activeMaskId by remember(photo.uri) { mutableStateOf(initialState.masks.firstOrNull()?.id) }
     var activeSpotId by remember(photo.uri) { mutableStateOf(initialState.healingSpots.firstOrNull()?.id) }
+    // When on, the preview paints a red overlay over the active mask's coverage (Lightroom-style visibility).
+    var showMask by remember(photo.uri) { mutableStateOf(false) }
+    // Auto-peek: briefly flash that overlay when you pick or adjust a mask, so it's discoverable without the toggle.
+    var maskPeek by remember(photo.uri) { mutableStateOf(false) }
     var historyJob by remember { mutableStateOf<Job?>(null) }
     // A preset is only a preview until the user taps Apply; `previewBase` is the look before the preview so Cancel
     // restores it exactly. Applied presets are recorded on the photo (presetId + presetBase), so tapping the applied
@@ -751,11 +782,21 @@ private fun EditorScreen(
         val full = editorBitmap ?: return@LaunchedEffect
         val draftSource = withContext(Dispatchers.Default) { full.scaledToFit(720) }
         var fullJob: Job? = null
-        snapshotFlow { develop.renderKey() }.conflate().collect { key ->
+        snapshotFlow { develop.renderKey() to (if ((showMask || maskPeek) && panel == ToolPanel.MASKS) activeMaskId else null) }.conflate().collect { (key, overlayId) ->
             fullJob?.cancel()
-            rendered = ImageExporter.renderPreview(draftSource, key, draft = true)
-            fullJob = launch { delay(220); rendered = ImageExporter.renderPreview(full, key) }
+            rendered = ImageExporter.renderPreview(draftSource, key, draft = true, maskOverlayId = overlayId)
+            fullJob = launch { delay(220); rendered = ImageExporter.renderPreview(full, key, maskOverlayId = overlayId) }
         }
+    }
+    // Flash the overlay for ~1.4s whenever the active mask changes or is moved/resized (restarts on each change,
+    // so it stays up during a drag). Skipped when the persistent toggle is already on, or for AI masks that have no
+    // geometry to adjust (the toggle still shows those).
+    val activeMaskGeom = develop.masks.firstOrNull { it.id == activeMaskId }
+        ?.let { "${it.type},${it.centerX},${it.centerY},${it.size},${it.aspect},${it.angle},${it.feather},${it.invert},${it.enabled},${it.brushStrokes.size}" }
+    LaunchedEffect(panel, activeMaskId, activeMaskGeom, showMask) {
+        if (panel == ToolPanel.MASKS && activeMaskId != null && !showMask) {
+            maskPeek = true; delay(1400); maskPeek = false
+        } else maskPeek = false
     }
     fun selectPanel(option: ToolPanel) {
         if (option != panel) cancelPreset()
@@ -767,14 +808,14 @@ private fun EditorScreen(
         Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth().height(52.dp).padding(horizontal = 4.dp)) {
             IconButton(onClick = ::back) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back to library", tint = Ink) }
             Text(photo.name, color = Ink, fontSize = 15.sp, fontWeight = FontWeight.Medium, maxLines = 1, modifier = Modifier.weight(1f))
-            ActionText("↶", undo.isNotEmpty() || previewBase != null) {
+            ActionText("↶", undo.isNotEmpty() || previewBase != null, description = "Undo") {
                 if (previewBase != null) cancelPreset()
                 else { historyJob?.cancel(); historyJob = null; redo.add(develop); develop = undo.removeAt(undo.lastIndex) }
             }
-            ActionText("↷", redo.isNotEmpty() && previewBase == null) { historyJob?.cancel(); historyJob = null; undo.add(develop); develop = redo.removeAt(redo.lastIndex) }
+            ActionText("↷", redo.isNotEmpty() && previewBase == null, description = "Redo") { historyJob?.cancel(); historyJob = null; undo.add(develop); develop = redo.removeAt(redo.lastIndex) }
             // Before/after: tap to toggle (holding the photo also shows the original while held).
-            IconButton(onClick = { compare = !compare }) { CompareIcon(if (compare) Accent else Ink) }
-            IconButton(onClick = { showHistogram = !showHistogram }) { HistogramIcon(if (showHistogram) Accent else Ink) }
+            IconButton(onClick = { compare = !compare }, modifier = Modifier.semantics { contentDescription = if (compare) "Hide before/after" else "Compare with original" }) { CompareIcon(if (compare) Accent else Ink) }
+            IconButton(onClick = { showHistogram = !showHistogram }, modifier = Modifier.semantics { contentDescription = if (showHistogram) "Hide histogram" else "Show histogram" }) { HistogramIcon(if (showHistogram) Accent else Ink) }
             IconButton(onClick = { showExport = true }, enabled = !exporting) {
                 if (exporting) CircularProgressIndicator(color = Accent, strokeWidth = 2.dp, modifier = Modifier.size(20.dp))
                 else Icon(Icons.Filled.Share, "Export", tint = Accent)
@@ -866,7 +907,16 @@ private fun EditorScreen(
                 panel == ToolPanel.BLUR -> "Drag to set the focus point"
                 else -> null
             }
-            if (previewHint != null) Text(previewHint, color = Color.White, fontSize = 11.sp, modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 2.dp).background(Color.Black.copy(.6f), RoundedCornerShape(50)).padding(horizontal = 12.dp, vertical = 5.dp))
+            if (previewHint != null && !loadFailed) Text(previewHint, color = Color.White, fontSize = 11.sp, modifier = Modifier.align(Alignment.BottomCenter).padding(bottom = 2.dp).background(Color.Black.copy(.6f), RoundedCornerShape(50)).padding(horizontal = 12.dp, vertical = 5.dp))
+            // Decode failed (missing/unsupported/revoked): show an error with recovery actions instead of a blank frame.
+            if (loadFailed) Column(Modifier.align(Alignment.Center).padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+                Text("Couldn't open this photo", color = Ink, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                Text("The file may be missing, moved, or no longer accessible.", color = Muted, fontSize = 12.sp, modifier = Modifier.padding(top = 6.dp))
+                Row(Modifier.padding(top = 14.dp), horizontalArrangement = Arrangement.spacedBy(20.dp)) {
+                    Text("Go back", color = Accent, fontSize = 14.sp, fontWeight = FontWeight.Bold, modifier = Modifier.clickable(onClick = onBack).padding(8.dp))
+                    Text("Remove", color = Color(0xFFFF7777), fontSize = 14.sp, fontWeight = FontWeight.Bold, modifier = Modifier.clickable(onClick = onDelete).padding(8.dp))
+                }
+            }
         }
         val group = ToolGroup.entries.first { panel in it.tools }
         Column(Modifier.fillMaxWidth().background(Panel)) {
@@ -901,7 +951,7 @@ private fun EditorScreen(
                         onPreview = ::previewPreset, onAmount = ::setPresetAmount, onApply = ::applyPreset, onCancel = ::cancelPreset,
                         thumbSource = thumbSource, thumbnailState = { presetResult(withoutPreset(previewBase ?: develop), it, 100f) },
                     )
-                    ToolPanel.MASKS -> MaskControls(develop, activeMaskId, { activeMaskId = it }, ::change)
+                    ToolPanel.MASKS -> MaskControls(develop, activeMaskId, { activeMaskId = it }, ::change, showMask, { showMask = it })
                     ToolPanel.REMOVE -> RemoveControls(develop, activeSpotId, { activeSpotId = it }, ::change)
                     ToolPanel.CROP -> CropControls(develop, orientedAspect(imageAspect, develop.rotation), ::change)
                     ToolPanel.GEOMETRY -> GeometryControls(develop, ::change)
@@ -956,8 +1006,12 @@ private fun ExportDialog(options: ExportOptions, onDismiss: () -> Unit, onExport
 }
 
 @Composable
-private fun ActionText(label: String, enabled: Boolean, action: () -> Unit) {
-    Box(Modifier.size(44.dp).clip(CircleShape).clickable(enabled = enabled, onClick = action), contentAlignment = Alignment.Center) {
+private fun ActionText(label: String, enabled: Boolean, description: String = label, action: () -> Unit) {
+    Box(
+        Modifier.size(44.dp).clip(CircleShape).clickable(enabled = enabled, onClick = action)
+            .semantics { contentDescription = description },
+        contentAlignment = Alignment.Center,
+    ) {
         Text(label, color = if (enabled) Ink else Muted.copy(.35f), fontSize = 22.sp)
     }
 }
@@ -1191,7 +1245,10 @@ private fun PresetTile(
             )
             if (applied) Text("✓", color = CanvasBlack, fontSize = 11.sp, fontWeight = FontWeight.Bold, modifier = Modifier.align(Alignment.TopStart).padding(5.dp).background(Accent, CircleShape).padding(horizontal = 5.dp, vertical = 1.dp))
         }
-        Text(preset.name, color = if (highlighted) Accent else Ink, fontSize = 10.sp, maxLines = 1, modifier = Modifier.padding(top = 4.dp))
+        Text(
+            preset.name, color = if (highlighted) Accent else Ink, fontSize = 10.sp, lineHeight = 12.sp,
+            maxLines = 2, overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis, modifier = Modifier.padding(top = 4.dp),
+        )
     }
 }
 
@@ -1270,6 +1327,8 @@ private fun MaskControls(
     activeId: String?,
     select: (String?) -> Unit,
     update: (DevelopState) -> Unit,
+    showMask: Boolean = false,
+    onShowMask: (Boolean) -> Unit = {},
 ) {
     LaunchedEffect(state.masks, activeId) {
         if (activeId != null && state.masks.none { it.id == activeId }) select(state.masks.lastOrNull()?.id)
@@ -1291,6 +1350,10 @@ private fun MaskControls(
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
         Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) { EditorTitle("MASKING", "Local, feathered adjustments") }
+            if (state.masks.isNotEmpty()) FilterChip(
+                selected = showMask, onClick = { onShowMask(!showMask) },
+                label = { Text("Show mask", fontSize = 10.sp) }, modifier = Modifier.padding(end = 8.dp),
+            )
             Text("${state.masks.size}/8", color = Muted, fontSize = 10.sp)
         }
         // Wrapping rows: every mask type stays visible on a narrow phone (manual tools first, then AI selections).
@@ -1346,6 +1409,11 @@ private fun MaskControls(
                 EditorSlider(when (active.type) { "Linear" -> "Width"; "Brush" -> "Brush size"; else -> "Size" }, active.size * 100f, if (active.type == "Brush") 1f..30f else 5f..100f, { replace(active.copy(size = it / 100f)) })
                 if (active.type == "Brush") EditorSlider("Flow", active.flow * 100f, 5f..100f, { replace(active.copy(flow = it / 100f)) })
                 if (active.type == "Linear") EditorSlider("Angle", active.angle, -180f..180f, { replace(active.copy(angle = it)) })
+                if (active.type == "Radial") {
+                    // Aspect < 100 = wider than tall, > 100 = taller; Angle rotates the ellipse. Drag handles on the photo do the same.
+                    EditorSlider("Aspect", active.aspect * 100f, 20f..500f, { replace(active.copy(aspect = it / 100f)) })
+                    EditorSlider("Angle", active.angle, -180f..180f, { replace(active.copy(angle = it)) })
+                }
             }
             Text(
                 when {
@@ -1403,21 +1471,86 @@ private fun MaskGuide(state: DevelopState, activeId: String?, imageAspect: Float
         if ((last.x - point.x) * (last.x - point.x) + (last.y - point.y) * (last.y - point.y) < .000064f || strokes.sumOf { it.size } >= MAX_BRUSH_POINTS) return
         push(strokes.dropLast(1) + listOf(strokes.last() + point))
     }
+    // Radial drag mode picked at gesture start: 0 = move the centre, 1 = resize + rotate (main-axis handle),
+    // 2 = reshape into an ellipse (cross-axis handle).
+    var radialDrag by remember(active.id) { mutableStateOf(0) }
     Canvas(Modifier.fillMaxSize().pointerInput(active.id, active.type) {
         if (active.type == "Brush") detectTapGestures(onTap = { p -> normalized(p, size.width.toFloat(), size.height.toFloat())?.let(::startStroke) })
     }.pointerInput(active.id, active.type) {
         detectDragGestures(
-            onDragStart = { position -> if (active.type == "Brush") normalized(position, size.width.toFloat(), size.height.toFloat())?.let(::startStroke) },
+            onDragStart = { position ->
+                when (active.type) {
+                    "Brush" -> normalized(position, size.width.toFloat(), size.height.toFloat())?.let(::startStroke)
+                    "Radial" -> {
+                        val rect = fittedImageRect(androidx.compose.ui.geometry.Size(size.width.toFloat(), size.height.toFloat()), imageAspect)
+                        val unit = minOf(rect.width, rect.height)
+                        val m = latestState.masks.firstOrNull { it.id == active.id } ?: active
+                        val c = androidx.compose.ui.geometry.Offset(rect.left + m.centerX * rect.width, rect.top + m.centerY * rect.height)
+                        val a = Math.toRadians(m.angle.toDouble())
+                        val mainH = c + androidx.compose.ui.geometry.Offset(cos(a).toFloat(), sin(a).toFloat()) * (m.size * unit)
+                        val crossH = c + androidx.compose.ui.geometry.Offset(-sin(a).toFloat(), cos(a).toFloat()) * (m.size * m.aspect.coerceIn(.2f, 5f) * unit)
+                        val touch = 26.dp.toPx()
+                        radialDrag = when {
+                            (position - mainH).getDistance() < touch -> 1
+                            (position - crossH).getDistance() < touch -> 2
+                            else -> 0
+                        }
+                    }
+                    "Linear" -> {
+                        val rect = fittedImageRect(androidx.compose.ui.geometry.Size(size.width.toFloat(), size.height.toFloat()), imageAspect)
+                        val unit = minOf(rect.width, rect.height)
+                        val m = latestState.masks.firstOrNull { it.id == active.id } ?: active
+                        val c = androidx.compose.ui.geometry.Offset(rect.left + m.centerX * rect.width, rect.top + m.centerY * rect.height)
+                        val a = Math.toRadians(m.angle.toDouble())
+                        val normal = androidx.compose.ui.geometry.Offset(cos(a).toFloat(), sin(a).toFloat())
+                        val dir = androidx.compose.ui.geometry.Offset(-sin(a).toFloat(), cos(a).toFloat())
+                        val half = m.size * m.feather * unit / 2f
+                        val touch = 26.dp.toPx()
+                        radialDrag = when {
+                            (position - (c + dir * (unit * 0.35f))).getDistance() < touch || (position - (c - dir * (unit * 0.35f))).getDistance() < touch -> 1
+                            (position - (c + normal * half)).getDistance() < touch || (position - (c - normal * half)).getDistance() < touch -> 2
+                            else -> 0
+                        }
+                    }
+                    else -> radialDrag = 0
+                }
+            },
         ) { event, drag ->
             event.consume()
             if (active.type == "Brush") {
                 normalized(event.position, size.width.toFloat(), size.height.toFloat())?.let(::extendStroke)
             } else {
-                val imageRect = fittedImageRect(androidx.compose.ui.geometry.Size(size.width.toFloat(), size.height.toFloat()), imageAspect)
-                updateMask { mask ->
+                val rect = fittedImageRect(androidx.compose.ui.geometry.Size(size.width.toFloat(), size.height.toFloat()), imageAspect)
+                val unit = minOf(rect.width, rect.height)
+                if ((active.type == "Radial" || active.type == "Linear") && radialDrag != 0) {
+                    updateMask { mask ->
+                        val c = androidx.compose.ui.geometry.Offset(rect.left + mask.centerX * rect.width, rect.top + mask.centerY * rect.height)
+                        val v = event.position - c
+                        if (active.type == "Radial") {
+                            if (radialDrag == 1) mask.copy(
+                                size = (v.getDistance() / unit.coerceAtLeast(1f)).coerceIn(.05f, 1f),
+                                angle = Math.toDegrees(kotlin.math.atan2(v.y.toDouble(), v.x.toDouble())).toFloat(),
+                            ) else {
+                                val a = Math.toRadians(mask.angle.toDouble())
+                                val crossDist = abs(v.x * -sin(a).toFloat() + v.y * cos(a).toFloat())
+                                mask.copy(aspect = (crossDist / (mask.size * unit).coerceAtLeast(1f)).coerceIn(.2f, 5f))
+                            }
+                        } else { // Linear: handle 1 rotates (grab the line end), handle 2 sets the transition width
+                            if (radialDrag == 1) {
+                                var na = Math.toDegrees(kotlin.math.atan2(v.y.toDouble(), v.x.toDouble())).toFloat() - 90f
+                                na = ((na + 180f) % 360f + 360f) % 360f - 180f
+                                mask.copy(angle = na)
+                            } else {
+                                val a = Math.toRadians(mask.angle.toDouble())
+                                val normalDist = abs(v.x * cos(a).toFloat() + v.y * sin(a).toFloat())
+                                mask.copy(size = (2f * normalDist / (mask.feather.coerceAtLeast(.02f) * unit)).coerceIn(.05f, 1f))
+                            }
+                        }
+                    }
+                } else updateMask { mask ->
                     mask.copy(
-                        centerX = (mask.centerX + drag.x / imageRect.width.coerceAtLeast(1f)).coerceIn(0f, 1f),
-                        centerY = (mask.centerY + drag.y / imageRect.height.coerceAtLeast(1f)).coerceIn(0f, 1f),
+                        centerX = (mask.centerX + drag.x / rect.width.coerceAtLeast(1f)).coerceIn(0f, 1f),
+                        centerY = (mask.centerY + drag.y / rect.height.coerceAtLeast(1f)).coerceIn(0f, 1f),
                     )
                 }
             }
@@ -1452,15 +1585,43 @@ private fun MaskGuide(state: DevelopState, activeId: String?, imageAspect: Float
                 drawLine(guide.copy(.55f), center - direction * extent - normal * halfTransition, center + direction * extent - normal * halfTransition, 1.dp.toPx())
                 drawLine(guide.copy(.55f), center - direction * extent + normal * halfTransition, center + direction * extent + normal * halfTransition, 1.dp.toPx())
             } else {
-                val radius = active.size * unit
-                drawCircle(guide.copy(.12f), radius, center)
-                drawCircle(guide, radius, center, style = Stroke(2.dp.toPx()))
-                drawCircle(guide.copy(.5f), radius * (1f - active.feather), center, style = Stroke(1.dp.toPx()))
+                // Radial ellipse: main radius along [angle], cross radius scaled by aspect. Drag the edge handles to size/rotate/reshape.
+                val r = active.size * unit
+                val rc = r * active.aspect.coerceIn(.2f, 5f)
+                val fr = (1f - active.feather).coerceAtLeast(.02f)
+                rotate(active.angle, center) {
+                    drawOval(guide.copy(.12f), topLeft = androidx.compose.ui.geometry.Offset(center.x - r, center.y - rc), size = androidx.compose.ui.geometry.Size(2 * r, 2 * rc))
+                    drawOval(guide, topLeft = androidx.compose.ui.geometry.Offset(center.x - r, center.y - rc), size = androidx.compose.ui.geometry.Size(2 * r, 2 * rc), style = Stroke(2.dp.toPx()))
+                    drawOval(guide.copy(.5f), topLeft = androidx.compose.ui.geometry.Offset(center.x - r * fr, center.y - rc * fr), size = androidx.compose.ui.geometry.Size(2 * r * fr, 2 * rc * fr), style = Stroke(1.dp.toPx()))
+                }
             }
         }
         if (active.type != "Brush") {
             drawCircle(Color.White, 5.dp.toPx(), center)
             drawCircle(guide, 8.dp.toPx(), center, style = Stroke(2.dp.toPx()))
+            // Resize/rotate (main axis) and reshape (cross axis) handles for radial.
+            if (active.type == "Radial") {
+                val a = Math.toRadians(active.angle.toDouble())
+                val r = active.size * unit; val rc = r * active.aspect.coerceIn(.2f, 5f)
+                val mainH = center + androidx.compose.ui.geometry.Offset(cos(a).toFloat(), sin(a).toFloat()) * r
+                val crossH = center + androidx.compose.ui.geometry.Offset(-sin(a).toFloat(), cos(a).toFloat()) * rc
+                listOf(mainH, crossH).forEach { handle ->
+                    drawCircle(Color.White, 6.dp.toPx(), handle); drawCircle(guide, 6.dp.toPx(), handle, style = Stroke(2.dp.toPx()))
+                }
+            }
+            // Rotate handles (ends of the line) and width handles (on the spread lines) for linear.
+            if (active.type == "Linear") {
+                val a = Math.toRadians(active.angle.toDouble())
+                val normalV = androidx.compose.ui.geometry.Offset(cos(a).toFloat(), sin(a).toFloat())
+                val dirV = androidx.compose.ui.geometry.Offset(-sin(a).toFloat(), cos(a).toFloat())
+                val half = active.size * active.feather * unit / 2f
+                listOf(center + dirV * (unit * 0.35f), center - dirV * (unit * 0.35f)).forEach { handle ->
+                    drawCircle(Color.White, 6.dp.toPx(), handle); drawCircle(guide, 6.dp.toPx(), handle, style = Stroke(2.dp.toPx()))
+                }
+                listOf(center + normalV * half, center - normalV * half).forEach { handle ->
+                    drawCircle(guide, 5.dp.toPx(), handle); drawCircle(Color.White, 5.dp.toPx(), handle, style = Stroke(1.5.dp.toPx()))
+                }
+            }
         }
     }
 }
@@ -2371,11 +2532,33 @@ private fun LensBlurControls(state: DevelopState, update: (DevelopState) -> Unit
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
         EditorTitle("LENS BLUR", "Bokeh with a focus area")
         EditorSlider("Amount", state.lensBlur, 0f..100f, { update(state.copy(lensBlur = it)) })
-        EditorSlider("Focus size", state.lensBlurFocusRadius * 100f, 5f..100f, { update(state.copy(lensBlurFocusRadius = it / 100f)) })
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-            Text("Reset", color = Accent, fontSize = 10.sp, modifier = Modifier.clickable { update(state.copy(lensBlur = 0f, lensBlurFocusX = .5f, lensBlurFocusY = .5f, lensBlurFocusRadius = .3f)) }.padding(8.dp))
+        Text("Keep in focus", color = Muted, fontSize = 10.sp, modifier = Modifier.padding(top = 10.dp, bottom = 4.dp))
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            listOf("None" to "Area", "Person" to "Person", "Face" to "Face").forEach { (value, label) ->
+                FilterChip(selected = state.lensBlurSubject == value, onClick = { update(state.copy(lensBlurSubject = value)) }, label = { Text(label, fontSize = 11.sp) })
+            }
         }
-        Text("Drag on the photo to set the in-focus point. Everything outside the focus area blurs; it renders at full resolution on export.", color = Muted, fontSize = 10.sp, modifier = Modifier.padding(top = 4.dp))
+        if (state.lensBlurSubject == "None") {
+            EditorSlider("Focus size", state.lensBlurFocusRadius * 100f, 5f..100f, { update(state.copy(lensBlurFocusRadius = it / 100f)) })
+            // Aspect < 100 = wide focus oval, > 100 = tall; Angle rotates it. Drag the handles on the photo for the same.
+            EditorSlider("Aspect", state.lensBlurAspect * 100f, 20f..500f, { update(state.copy(lensBlurAspect = it / 100f)) })
+            EditorSlider("Angle", state.lensBlurAngle, -180f..180f, { update(state.copy(lensBlurAngle = it)) })
+        }
+        Row(Modifier.fillMaxWidth().padding(top = 6.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            FilterChip(selected = state.lensBlurInvert, onClick = { update(state.copy(lensBlurInvert = !state.lensBlurInvert)) },
+                label = { Text(if (state.lensBlurSubject == "None") "Invert (blur centre)" else "Invert (blur subject)", fontSize = 11.sp) })
+        }
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+            Text("Reset", color = Accent, fontSize = 10.sp, modifier = Modifier.clickable {
+                update(state.copy(lensBlur = 0f, lensBlurFocusX = .5f, lensBlurFocusY = .5f, lensBlurFocusRadius = .3f,
+                    lensBlurAspect = 1f, lensBlurAngle = 0f, lensBlurSubject = "None", lensBlurInvert = false))
+            }.padding(8.dp))
+        }
+        Text(
+            if (state.lensBlurSubject == "None") "Drag on the photo to set the in-focus point; drag the ring handles to size and shape it. Renders at full resolution on export."
+            else "On-device AI keeps the ${state.lensBlurSubject.lowercase()} sharp and blurs the rest. Toggle Invert to blur the ${state.lensBlurSubject.lowercase()} instead.",
+            color = Muted, fontSize = 10.sp, modifier = Modifier.padding(top = 4.dp),
+        )
     }
 }
 
@@ -2383,21 +2566,67 @@ private fun LensBlurControls(state: DevelopState, update: (DevelopState) -> Unit
 private fun LensBlurGuide(state: DevelopState, imageAspect: Float, update: (DevelopState) -> Unit) {
     val latestState by rememberUpdatedState(state)
     val latestUpdate by rememberUpdatedState(update)
+    // 0 = move the focus point, 1 = resize + rotate (main handle), 2 = reshape into an ellipse (cross handle).
+    // The focus is measured in units of the frame's height, so handles use imageRect.height as the unit.
+    var mode by remember { mutableStateOf(0) }
     Canvas(Modifier.fillMaxSize().pointerInput(Unit) {
-        detectDragGestures { event, _ ->
+        detectDragGestures(
+            onDragStart = { position ->
+                val rect = fittedImageRect(androidx.compose.ui.geometry.Size(size.width.toFloat(), size.height.toFloat()), imageAspect)
+                val s = latestState
+                mode = if (s.lensBlurSubject != "None") 0 else {
+                    val c = androidx.compose.ui.geometry.Offset(rect.left + s.lensBlurFocusX * rect.width, rect.top + s.lensBlurFocusY * rect.height)
+                    val a = Math.toRadians(s.lensBlurAngle.toDouble())
+                    val r = s.lensBlurFocusRadius * rect.height
+                    val mainH = c + androidx.compose.ui.geometry.Offset(cos(a).toFloat(), sin(a).toFloat()) * r
+                    val crossH = c + androidx.compose.ui.geometry.Offset(-sin(a).toFloat(), cos(a).toFloat()) * (r * s.lensBlurAspect.coerceIn(.2f, 5f))
+                    val touch = 26.dp.toPx()
+                    when {
+                        (position - mainH).getDistance() < touch -> 1
+                        (position - crossH).getDistance() < touch -> 2
+                        else -> 0
+                    }
+                }
+            },
+        ) { event, _ ->
             event.consume()
-            val imageRect = fittedImageRect(androidx.compose.ui.geometry.Size(size.width.toFloat(), size.height.toFloat()), imageAspect)
-            val x = ((event.position.x - imageRect.left) / imageRect.width.coerceAtLeast(1f)).coerceIn(0f, 1f)
-            val y = ((event.position.y - imageRect.top) / imageRect.height.coerceAtLeast(1f)).coerceIn(0f, 1f)
-            latestUpdate(latestState.copy(lensBlurFocusX = x, lensBlurFocusY = y))
+            val s = latestState
+            if (s.lensBlurSubject != "None") return@detectDragGestures // subject AI defines focus; no geometric handles
+            val rect = fittedImageRect(androidx.compose.ui.geometry.Size(size.width.toFloat(), size.height.toFloat()), imageAspect)
+            if (mode != 0) {
+                val c = androidx.compose.ui.geometry.Offset(rect.left + s.lensBlurFocusX * rect.width, rect.top + s.lensBlurFocusY * rect.height)
+                val v = event.position - c
+                if (mode == 1) latestUpdate(s.copy(
+                    lensBlurFocusRadius = (v.getDistance() / rect.height.coerceAtLeast(1f)).coerceIn(.05f, 1f),
+                    lensBlurAngle = Math.toDegrees(kotlin.math.atan2(v.y.toDouble(), v.x.toDouble())).toFloat(),
+                )) else {
+                    val a = Math.toRadians(s.lensBlurAngle.toDouble())
+                    val crossDist = abs(v.x * -sin(a).toFloat() + v.y * cos(a).toFloat())
+                    latestUpdate(s.copy(lensBlurAspect = (crossDist / (s.lensBlurFocusRadius * rect.height).coerceAtLeast(1f)).coerceIn(.2f, 5f)))
+                }
+            } else {
+                val x = ((event.position.x - rect.left) / rect.width.coerceAtLeast(1f)).coerceIn(0f, 1f)
+                val y = ((event.position.y - rect.top) / rect.height.coerceAtLeast(1f)).coerceIn(0f, 1f)
+                latestUpdate(s.copy(lensBlurFocusX = x, lensBlurFocusY = y))
+            }
         }
     }) {
+        if (state.lensBlurSubject != "None") return@Canvas // subject focus has no geometric overlay
         val imageRect = fittedImageRect(size, imageAspect)
         val center = androidx.compose.ui.geometry.Offset(imageRect.left + state.lensBlurFocusX * imageRect.width, imageRect.top + state.lensBlurFocusY * imageRect.height)
-        val radius = (state.lensBlurFocusRadius * imageRect.height).coerceAtLeast(4f) // renderer measures focus in units of height
+        val r = (state.lensBlurFocusRadius * imageRect.height).coerceAtLeast(4f)
+        val rc = r * state.lensBlurAspect.coerceIn(.2f, 5f)
         clipRect(imageRect.left, imageRect.top, imageRect.right, imageRect.bottom) {
-            drawCircle(Accent.copy(.10f), radius, center)
-            drawCircle(Accent, radius, center, style = Stroke(2.dp.toPx()))
+            rotate(state.lensBlurAngle, center) {
+                drawOval(Accent.copy(.10f), topLeft = androidx.compose.ui.geometry.Offset(center.x - r, center.y - rc), size = androidx.compose.ui.geometry.Size(2 * r, 2 * rc))
+                drawOval(Accent, topLeft = androidx.compose.ui.geometry.Offset(center.x - r, center.y - rc), size = androidx.compose.ui.geometry.Size(2 * r, 2 * rc), style = Stroke(2.dp.toPx()))
+            }
+            val a = Math.toRadians(state.lensBlurAngle.toDouble())
+            val mainH = center + androidx.compose.ui.geometry.Offset(cos(a).toFloat(), sin(a).toFloat()) * r
+            val crossH = center + androidx.compose.ui.geometry.Offset(-sin(a).toFloat(), cos(a).toFloat()) * rc
+            listOf(mainH, crossH).forEach { handle ->
+                drawCircle(Color.White, 6.dp.toPx(), handle); drawCircle(Accent, 6.dp.toPx(), handle, style = Stroke(2.dp.toPx()))
+            }
             drawCircle(Color.White, 5.dp.toPx(), center)
             drawCircle(Accent, 8.dp.toPx(), center, style = Stroke(2.dp.toPx()))
         }

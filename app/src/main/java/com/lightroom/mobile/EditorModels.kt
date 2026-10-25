@@ -107,6 +107,8 @@ data class LocalMask(
     val size: Float = .42f,
     val feather: Float = .55f,
     val angle: Float = 0f,
+    /** Radial only: ratio of the cross axis to the main axis. 1 = circle, <1 wider, >1 taller (before [angle]). */
+    val aspect: Float = 1f,
     val invert: Boolean = false,
     val exposure: Float = 0f,
     val contrast: Float = 0f,
@@ -203,6 +205,12 @@ data class DevelopState(
     val lensBlurFocusX: Float = .5f,
     val lensBlurFocusY: Float = .5f,
     val lensBlurFocusRadius: Float = .3f,
+    /** Lens blur focus-area shape: ellipse cross/main ratio (1 = circle) and its rotation in degrees. */
+    val lensBlurAspect: Float = 1f,
+    val lensBlurAngle: Float = 0f,
+    /** On-device subject kept in focus ("None", "Person", "Face"); [lensBlurInvert] blurs the subject instead. */
+    val lensBlurSubject: String = "None",
+    val lensBlurInvert: Boolean = false,
     val background: String = "None",
     val masks: List<LocalMask> = emptyList(),
     val healingSpots: List<HealingSpot> = emptyList(),
@@ -420,13 +428,16 @@ fun DevelopState.toJson(): JSONObject = JSONObject().apply {
     put("geometryHorizontal", geometryHorizontal); put("geometryAspect", geometryAspect); put("opticsVignette", opticsVignette)
     put("defringe", defringe); put("lensDistortion", lensDistortion)
     put("lensBlur", lensBlur); put("lensBlurFocusX", lensBlurFocusX); put("lensBlurFocusY", lensBlurFocusY)
-    put("lensBlurFocusRadius", lensBlurFocusRadius); put("background", background); put("profile", profile)
+    put("lensBlurFocusRadius", lensBlurFocusRadius)
+    put("lensBlurAspect", lensBlurAspect); put("lensBlurAngle", lensBlurAngle)
+    put("lensBlurSubject", lensBlurSubject); put("lensBlurInvert", lensBlurInvert)
+    put("background", background); put("profile", profile)
     put("masks", JSONArray().apply {
         masks.forEach { mask ->
             put(JSONObject().apply {
                 put("id", mask.id); put("type", mask.type); put("enabled", mask.enabled)
                 put("centerX", mask.centerX); put("centerY", mask.centerY); put("size", mask.size)
-                put("feather", mask.feather); put("angle", mask.angle); put("invert", mask.invert)
+                put("feather", mask.feather); put("angle", mask.angle); put("aspect", mask.aspect); put("invert", mask.invert)
                 put("exposure", mask.exposure); put("contrast", mask.contrast)
                 put("temperature", mask.temperature); put("saturation", mask.saturation)
                 put("highlights", mask.highlights); put("shadows", mask.shadows); put("tint", mask.tint)
@@ -487,6 +498,7 @@ private fun masksFromJson(json: JSONArray?): List<LocalMask> {
             size = item.safeFloat("size", .42f).coerceIn(.005f, 1f),
             feather = item.safeFloat("feather", .55f).coerceIn(.02f, 1f),
             angle = item.safeFloat("angle").coerceIn(-180f, 180f),
+            aspect = item.safeFloat("aspect", 1f).coerceIn(.2f, 5f),
             invert = item.optBoolean("invert"),
             exposure = item.safeFloat("exposure").coerceIn(-4f, 4f),
             contrast = item.safeFloat("contrast").coerceIn(-100f, 100f),
@@ -610,6 +622,10 @@ fun developStateFromJson(json: JSONObject): DevelopState = DevelopState(
     lensBlurFocusX = json.safeFloat("lensBlurFocusX", .5f).coerceIn(0f, 1f),
     lensBlurFocusY = json.safeFloat("lensBlurFocusY", .5f).coerceIn(0f, 1f),
     lensBlurFocusRadius = json.safeFloat("lensBlurFocusRadius", .3f).coerceIn(.05f, 1f),
+    lensBlurAspect = json.safeFloat("lensBlurAspect", 1f).coerceIn(.2f, 5f),
+    lensBlurAngle = json.safeFloat("lensBlurAngle").coerceIn(-180f, 180f),
+    lensBlurSubject = json.optString("lensBlurSubject", "None").takeIf { it in setOf("None", "Person", "Face") } ?: "None",
+    lensBlurInvert = json.optBoolean("lensBlurInvert"),
     background = json.optString("background", "None"),
     masks = masksFromJson(json.optJSONArray("masks")),
     healingSpots = healingSpotsFromJson(json.optJSONArray("healingSpots")),

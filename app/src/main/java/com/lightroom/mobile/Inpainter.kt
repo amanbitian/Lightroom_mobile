@@ -21,7 +21,7 @@ import kotlin.math.max
 import kotlin.math.min
 
 /**
- * Generative Remove with LaMa-Dilated (Qualcomm AI Hub's LiteRT build, Apache-2.0). The 174 MB model is
+ * Generative Remove with LaMa-Dilated (Qualcomm AI Hub's LiteRT build, Apache-2.0). The 170 MB model is
  * downloaded on first use into app storage and verified; until then callers fall back to the classic fill.
  * Inference runs on a 512x512 window around each spot and the result is blended back with a feathered edge.
  */
@@ -37,6 +37,8 @@ object Inpainter {
     private const val MODEL_ENTRY = "lama_dilated.tflite"
     private const val MODEL_SHA256 = "0d453a9a6fafdd52db8b11834799adc069b99465d1a65fc3df5b954773fa84d3"
     const val DOWNLOAD_MB = 170
+    // The unpacked model is ~174 MB; a file much smaller than this is truncated/corrupt, so we don't trust it.
+    private const val MODEL_MIN_BYTES = 150_000_000L
     private const val SIZE = 512
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -50,7 +52,15 @@ object Inpainter {
     private fun modelFile() = File(LiteRtModels.appContext.filesDir, "models/$MODEL_ENTRY")
 
     /** Call once at startup so the UI knows whether the model is already on the device. */
-    fun refresh() { if (_status.value !is Status.Downloading) _status.value = if (modelFile().exists()) Status.Ready else Status.NotInstalled }
+    fun refresh() {
+        if (_status.value is Status.Downloading) return
+        val file = modelFile()
+        _status.value = when {
+            file.exists() && file.length() >= MODEL_MIN_BYTES -> Status.Ready
+            file.exists() -> { file.delete(); Status.NotInstalled } // truncated/corrupt download
+            else -> Status.NotInstalled
+        }
+    }
 
     val isReady: Boolean get() = _status.value == Status.Ready
 
@@ -155,7 +165,13 @@ object Inpainter {
         region.blend(image, restored, left, top, opacity)
         restored.recycle()
         true
-    }.getOrDefault(false).also { scheduleRelease() }
+    }.getOrElse { error ->
+        // A corrupt or incompatible model makes loading/inference throw: drop it and mark failed so the
+        // Retouch card offers a fresh download instead of silently staying "installed".
+        synchronized(this) { interpreter?.close(); interpreter = null }
+        if (error !is kotlinx.coroutines.CancellationException) { modelFile().delete(); _status.value = Status.Failed("AI model was unreadable — download it again") }
+        false
+    }.also { scheduleRelease() }
 
     /**
      * LaMa returns known pixels untouched, but its fill can sit slightly off-tone right at the hole's edge, which

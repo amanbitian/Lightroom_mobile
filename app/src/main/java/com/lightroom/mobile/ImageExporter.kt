@@ -226,10 +226,24 @@ object ImageExporter {
                 }
             }
             val (fx, fy) = point(state.lensBlurFocusX, state.lensBlurFocusY)
+            // Transform the focus ellipse through the same geometry: map its main and cross axis tips and rebuild
+            // radius/angle/aspect, so an angled elliptical blur matches across rotation, crop and lens correction.
+            val theta = Math.toRadians(state.lensBlurAngle.toDouble())
+            val cosT = cos(theta).toFloat(); val sinT = sin(theta).toFloat()
+            val focusR = state.lensBlurFocusRadius; val asp = state.lensBlurAspect.coerceIn(.2f, 5f)
+            val sHW = srcH.toFloat() / srcW // focus is measured in height-isotropic units
+            val (mx, my) = point(state.lensBlurFocusX + cosT * focusR * sHW, state.lensBlurFocusY + sinT * focusR)
+            val (crx, cry) = point(state.lensBlurFocusX - sinT * focusR * asp * sHW, state.lensBlurFocusY + cosT * focusR * asp)
+            val oHW = outW.toFloat() / outH
+            val mainX = (mx - fx) * oHW; val mainY = my - fy
+            val crossX = (crx - fx) * oHW; val crossY = cry - fy
+            val newRadius = sqrt(mainX * mainX + mainY * mainY).coerceIn(.05f, 1f)
             return state.copy(
                 healingSpots = spots, masks = masks,
                 lensBlurFocusX = fx, lensBlurFocusY = fy,
-                lensBlurFocusRadius = length(state.lensBlurFocusRadius, srcH, outH),
+                lensBlurFocusRadius = newRadius,
+                lensBlurAngle = Math.toDegrees(kotlin.math.atan2(mainY.toDouble(), mainX.toDouble())).toFloat(),
+                lensBlurAspect = (sqrt(crossX * crossX + crossY * crossY) / newRadius.coerceAtLeast(1e-4f)).coerceIn(.2f, 5f),
             )
         }
     }
@@ -415,14 +429,32 @@ object ImageExporter {
         val focus = state.lensBlurFocusRadius.coerceIn(.05f, 1f)
         val feather = focus * 0.8f + 0.1f
         val aspect = w.toFloat() / h
+        val ellipseAspect = state.lensBlurAspect.coerceIn(.2f, 5f)
+        val la = Math.toRadians(state.lensBlurAngle.toDouble()); val lc = cos(la).toFloat(); val ls = sin(la).toFloat()
+        // Subject focus: keep the detected subject sharp (or, inverted, blur it) instead of a geometric area.
+        val subjectMask = when (state.lensBlurSubject) {
+            "Person" -> SubjectSegmenter.foregroundMask(src)
+            "Face" -> SubjectSegmenter.mask(src, SubjectSegmenter.Part.FACE)
+            else -> null
+        }?.let { SubjectSegmenter.Mask(it.width, it.height, featherMask(it.confidence, it.width, it.height, (minOf(it.width, it.height) * 0.02f).toInt().coerceIn(1, 24))) }
+        val useSubject = subjectMask != null
+        // Subject focus was requested but segmentation is unavailable: leave the photo sharp rather than
+        // silently applying the hidden geometric focus area (which the subject UI doesn't expose).
+        if (state.lensBlurSubject != "None" && subjectMask == null) { blur.recycle(); return target }
         val orig = IntArray(w); val blurRow = IntArray(w)
         for (y in 0 until h) {
             target.getPixels(orig, 0, w, 0, y, w, 1); blur.getPixels(blurRow, 0, w, 0, y, w, 1)
             val ny = y.toFloat() / (h - 1)
             for (x in 0 until w) {
                 val nx = x.toFloat() / (w - 1)
-                val ddx = (nx - cx) * aspect; val ddy = ny - cy
-                val weight = ((sqrt(ddx * ddx + ddy * ddy) - focus) / feather).coerceIn(0f, 1f)
+                val weight = if (useSubject) {
+                    val sharp = sampleMaskAlpha(subjectMask, nx, ny).let { if (state.lensBlurInvert) 1f - it else it }
+                    (1f - sharp).coerceIn(0f, 1f)
+                } else {
+                    val ddx = (nx - cx) * aspect; val ddy = ny - cy
+                    val rx = ddx * lc + ddy * ls; val ry = (-ddx * ls + ddy * lc) / ellipseAspect
+                    ((sqrt(rx * rx + ry * ry) - focus) / feather).coerceIn(0f, 1f).let { if (state.lensBlurInvert) 1f - it else it }
+                }
                 if (weight <= .001f) continue
                 val o = orig[x]; val b = blurRow[x]
                 fun mix(sh: Int): Int { val a = (o shr sh) and 255; val c = (b shr sh) and 255; return (a + (c - a) * weight).toInt().coerceIn(0, 255) }
@@ -466,9 +498,16 @@ object ImageExporter {
 
     private fun sampleMaskAlpha(mask: SubjectSegmenter.Mask?, px: Float, py: Float): Float {
         if (mask == null) return 0f
-        val mx = (px * (mask.width - 1)).toInt().coerceIn(0, mask.width - 1)
-        val my = (py * (mask.height - 1)).toInt().coerceIn(0, mask.height - 1)
-        return mask.confidence[my * mask.width + mx].coerceIn(0f, 1f)
+        // Bilinear: the mask is only 256x256, so nearest-neighbour upscaling left the subject edge stair-stepped.
+        val fx = (px * (mask.width - 1)).coerceIn(0f, mask.width - 1f)
+        val fy = (py * (mask.height - 1)).coerceIn(0f, mask.height - 1f)
+        val x0 = fx.toInt(); val y0 = fy.toInt()
+        val x1 = min(x0 + 1, mask.width - 1); val y1 = min(y0 + 1, mask.height - 1)
+        val tx = fx - x0; val ty = fy - y0
+        val c = mask.confidence
+        val top = c[y0 * mask.width + x0] * (1 - tx) + c[y0 * mask.width + x1] * tx
+        val bottom = c[y1 * mask.width + x0] * (1 - tx) + c[y1 * mask.width + x1] * tx
+        return (top * (1 - ty) + bottom * ty).coerceIn(0f, 1f)
     }
 
     /** Separable box blur over a float mask so the foreground edge feathers instead of cutting hard. */
@@ -585,7 +624,7 @@ object ImageExporter {
      * Renders an edit onto [source] (left untouched) in the photo's own frame, for the editor preview. Crop,
      * rotation and the post-crop vignette are drawn by the editor itself; everything else runs the export code.
      */
-    suspend fun renderPreview(source: Bitmap, state: DevelopState, draft: Boolean = false, thumbnail: Boolean = false): Bitmap = withContext(Dispatchers.Default) {
+    suspend fun renderPreview(source: Bitmap, state: DevelopState, draft: Boolean = false, thumbnail: Boolean = false, maskOverlayId: String? = null): Bitmap = withContext(Dispatchers.Default) {
         val check = { ensureActive() }
         // Thumbnails (preset strip) bypass the shared caches, so they never evict the main preview's segmentation/heal.
         val healed = if (thumbnail) applyHealing(source.copy(Bitmap.Config.ARGB_8888, true), state) else previewHealing(source, state.healingSpots, draft)
@@ -594,7 +633,59 @@ object ImageExporter {
         // Drafts (while dragging) skip sharpening/noise reduction, which only read at full size anyway.
         val adjusted = adjustPixels(healed, state, frameEffects = thumbnail, segmentationKey = key, checkCancelled = check, detail = !draft)
         check()
-        applyLensBlur(applyBackground(adjusted, state, segmentationKey = key), state)
+        val result = applyLensBlur(applyBackground(adjusted, state, segmentationKey = key), state)
+        if (maskOverlayId != null) maskOverlay(result, state, maskOverlayId, key) else result
+    }
+
+    /**
+     * Paints a translucent red over everything the mask [maskId] covers (its weight > 0), so the editor can show
+     * exactly what a mask/filter affects — like Lightroom's mask overlay. Handles geometric, brush and AI masks.
+     */
+    internal fun maskOverlay(frame: Bitmap, state: DevelopState, maskId: String, segmentationKey: Any? = null): Bitmap {
+        val mask = state.masks.firstOrNull { it.id == maskId && it.enabled } ?: return frame
+        val w = frame.width; val h = frame.height
+        val shortSide = minOf(w, h).toFloat()
+        val cosA = cos(Math.toRadians(mask.angle.toDouble())).toFloat(); val sinA = sin(Math.toRadians(mask.angle.toDouble())).toFloat()
+        val brush = if (mask.type == "Brush") renderBrushMask(mask, w, h) else null
+        val ai = if (mask.type in aiMaskTypes) cachedSegmentation(segmentationKey, mask.type) { segment(mask.type, frame) }
+            ?.let { SubjectSegmenter.Mask(it.width, it.height, featherMask(it.confidence, it.width, it.height, (minOf(it.width, it.height) * 0.012f).toInt().coerceIn(1, 24))) } else null
+        val target = mutable(frame)
+        val row = IntArray(w)
+        for (y in 0 until h) {
+            target.getPixels(row, 0, w, 0, y, w, 1)
+            val py = y.toFloat() / max(1, h - 1)
+            for (x in 0 until w) {
+                val px = x.toFloat() / max(1, w - 1)
+                var weight = when (mask.type) {
+                    "Linear" -> {
+                        val projected = ((px - mask.centerX) * w * cosA + (py - mask.centerY) * h * sinA) / shortSide
+                        (projected / (mask.size * mask.feather).coerceAtLeast(.02f) + .5f).coerceIn(0f, 1f)
+                    }
+                    "Radial" -> {
+                        val dx = (px - mask.centerX) * w / shortSide; val dy = (py - mask.centerY) * h / shortSide
+                        val rx = dx * cosA + dy * sinA; val ry = (-dx * sinA + dy * cosA) / mask.aspect.coerceIn(.2f, 5f)
+                        val distance = sqrt(rx * rx + ry * ry)
+                        val outer = mask.size.coerceAtLeast(.05f); val inner = outer * (1f - mask.feather.coerceIn(.02f, 1f))
+                        when { distance <= inner -> 1f; distance >= outer -> 0f; else -> 1f - (distance - inner) / (outer - inner).coerceAtLeast(.001f) }
+                    }
+                    "Brush" -> brush?.let { b ->
+                        val bx = (px * (b.width - 1)).toInt().coerceIn(0, b.width - 1); val by = (py * (b.height - 1)).toInt().coerceIn(0, b.height - 1)
+                        ((b.alpha[by * b.width + bx] ushr 24) and 255) / 255f
+                    } ?: 0f
+                    else -> sampleMaskAlpha(ai, px, py)
+                }
+                if (mask.invert) weight = 1f - weight
+                if (weight <= .01f) continue
+                val a = (weight * .5f).coerceIn(0f, .5f)
+                val o = row[x]
+                val nr = ((o shr 16 and 255) + (230 - (o shr 16 and 255)) * a).toInt().coerceIn(0, 255)
+                val ng = ((o shr 8 and 255) + (45 - (o shr 8 and 255)) * a).toInt().coerceIn(0, 255)
+                val nb = ((o and 255) + (70 - (o and 255)) * a).toInt().coerceIn(0, 255)
+                row[x] = (o and -0x1000000) or (nr shl 16) or (ng shl 8) or nb
+            }
+            target.setPixels(row, 0, w, 0, y, w, 1)
+        }
+        return target
     }
 
     /**

@@ -104,11 +104,50 @@ object PushPullFill {
         val g = FloatArray(w * h) { (pixels[it] shr 8 and 255) * weight[it] }
         val b = FloatArray(w * h) { (pixels[it] and 255) * weight[it] }
         val filled = pull(r, g, b, weight, w, h)
+        // Push-pull alone is a smooth blur. Copy high-frequency texture from valid neighbours (mirrored across
+        // the hole edge) onto the smooth base, so the fill reads as surrounding detail instead of a plastic patch.
+        addTexture(filled, pixels, weight, w, h)
         val fillBitmap = Bitmap.createBitmap(IntArray(w * h) { i ->
             -0x1000000 or (filled[0][i].toInt().coerceIn(0, 255) shl 16) or (filled[1][i].toInt().coerceIn(0, 255) shl 8) or filled[2][i].toInt().coerceIn(0, 255)
         }, w, h, Bitmap.Config.ARGB_8888)
         region.blend(image, fillBitmap, left, top, opacity)
         fillBitmap.recycle()
+    }
+
+    /**
+     * Adds local texture to the smooth [filled] base inside the hole (weight == 0). For each hole pixel it finds
+     * the nearest valid pixel by an 8-direction ray search, mirrors to a donor the same depth into valid territory,
+     * and adds that donor's high-frequency detail (donor minus its 3x3 valid neighbourhood). The low frequencies
+     * stay from push-pull (so the colour is right); only fine detail is borrowed, clamped so no hard edge leaks in.
+     */
+    private fun addTexture(filled: Array<FloatArray>, pixels: IntArray, weight: FloatArray, w: Int, h: Int) {
+        fun valid(x: Int, y: Int) = x in 0 until w && y in 0 until h && weight[y * w + x] > 0f
+        val dirs = arrayOf(1 to 0, -1 to 0, 0 to 1, 0 to -1, 1 to 1, 1 to -1, -1 to 1, -1 to -1)
+        val reach = max(w, h)
+        for (y in 0 until h) for (x in 0 until w) {
+            if (weight[y * w + x] > 0f) continue // only fill holes
+            var bestT = Int.MAX_VALUE; var dxBest = 0; var dyBest = 0
+            for ((dx, dy) in dirs) {
+                var t = 1
+                while (t <= reach && x + dx * t in 0 until w && y + dy * t in 0 until h && weight[(y + dy * t) * w + (x + dx * t)] <= 0f) t++
+                if (t <= reach && x + dx * t in 0 until w && y + dy * t in 0 until h && t < bestT) { bestT = t; dxBest = dx; dyBest = dy }
+            }
+            if (bestT == Int.MAX_VALUE) continue
+            // Mirror the hole depth onto the far (valid) side; fall back to the boundary pixel if that lands off/again in the hole.
+            var dx = x + dxBest * (2 * bestT - 1); var dy = y + dyBest * (2 * bestT - 1)
+            if (!valid(dx, dy)) { dx = x + dxBest * bestT; dy = y + dyBest * bestT }
+            if (!valid(dx, dy)) continue
+            var sr = 0f; var sg = 0f; var sb = 0f; var n = 0
+            for (ny in dy - 1..dy + 1) for (nx in dx - 1..dx + 1) if (valid(nx, ny)) {
+                val c = pixels[ny * w + nx]; sr += c shr 16 and 255; sg += c shr 8 and 255; sb += c and 255; n++
+            }
+            if (n == 0) continue
+            val c = pixels[dy * w + dx]
+            val i = y * w + x
+            filled[0][i] = (filled[0][i] + ((c shr 16 and 255) - sr / n).coerceIn(-48f, 48f)).coerceIn(0f, 255f)
+            filled[1][i] = (filled[1][i] + ((c shr 8 and 255) - sg / n).coerceIn(-48f, 48f)).coerceIn(0f, 255f)
+            filled[2][i] = (filled[2][i] + ((c and 255) - sb / n).coerceIn(-48f, 48f)).coerceIn(0f, 255f)
+        }
     }
 
     /** Smoothly interpolates three channels known where [w] > 0 (values given unweighted) over the whole grid. */

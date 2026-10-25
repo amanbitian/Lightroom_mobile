@@ -178,7 +178,10 @@ class ColorEngine(
                         }
                         "Radial" -> {
                             val dx = (px - mask.centerX) * width / shortSide; val dy = (py - mask.centerY) * height / shortSide
-                            val distance = sqrt(dx * dx + dy * dy)
+                            // Rotate into the ellipse's own frame, then stretch the cross axis so the test is round again.
+                            val rx = dx * maskCos[m] + dy * maskSin[m]
+                            val ry = (-dx * maskSin[m] + dy * maskCos[m]) / mask.aspect.coerceIn(.2f, 5f)
+                            val distance = sqrt(rx * rx + ry * ry)
                             val outer = mask.size.coerceAtLeast(.05f); val inner = outer * (1f - mask.feather.coerceIn(.02f, 1f))
                             when { distance <= inner -> 1f; distance >= outer -> 0f; else -> 1f - (distance - inner) / (outer - inner).coerceAtLeast(.001f) }
                         }
